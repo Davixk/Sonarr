@@ -7,6 +7,7 @@ namespace NzbDrone.Core.IndexerSearch
         public int SeriesId { get; set; }
 
         public override bool SendUpdatesToClient => true;
+        public override bool IsSearchCommand => true;
 
         public SeriesSearchCommand()
         {

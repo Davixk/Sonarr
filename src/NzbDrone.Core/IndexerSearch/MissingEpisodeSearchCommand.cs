@@ -8,6 +8,7 @@ namespace NzbDrone.Core.IndexerSearch
         public bool Monitored { get; set; }
 
         public override bool SendUpdatesToClient => true;
+        public override bool IsSearchCommand => true;
 
         public MissingEpisodeSearchCommand()
         {

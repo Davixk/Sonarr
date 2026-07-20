@@ -15,6 +15,8 @@ namespace NzbDrone.Core.IndexerSearch
             }
         }
 
+        public override bool IsSearchCommand => true;
+
         public CutoffUnmetEpisodeSearchCommand()
         {
             Monitored = true;

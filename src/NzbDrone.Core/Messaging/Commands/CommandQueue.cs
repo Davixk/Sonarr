@@ -11,12 +11,22 @@ namespace NzbDrone.Core.Messaging.Commands
         private readonly object _mutex = new object();
         private readonly List<CommandModel> _items;
 
+        private int _maxConcurrentSearch = int.MaxValue;
+
         public CommandQueue()
         {
             _items = new List<CommandModel>();
         }
 
         public int Count => _items.Count;
+
+        public void SetMaxConcurrentSearch(int max)
+        {
+            lock (_mutex)
+            {
+                _maxConcurrentSearch = Math.Max(1, max);
+            }
+        }
 
         public void Add(CommandModel item)
         {
@@ -144,7 +154,7 @@ namespace NzbDrone.Core.Messaging.Commands
             }
         }
 
-        private bool TryGet(out CommandModel item)
+        public bool TryGet(out CommandModel item)
         {
             var rval = true;
             item = default(CommandModel);
@@ -160,7 +170,7 @@ namespace NzbDrone.Core.Messaging.Commands
                     var startedCommands = _items.Where(c => c.Status == CommandStatus.Started)
                                                 .ToList();
 
-                    var localItem = _items.Where(c =>
+                    var queuedCommands = _items.Where(c =>
                                           {
                                               // If an executing command requires disk access don't return a command that
                                               // requires disk access. A lower priority or later queued task could be returned
@@ -183,8 +193,17 @@ namespace NzbDrone.Core.Messaging.Commands
                                               }
 
                                               return c.Status == CommandStatus.Queued;
-                                          })
-                                          .OrderByDescending(c => c.Priority)
+                                          });
+
+                    // Reserve a worker lane for non-search commands: once the concurrent search cap is
+                    // reached, stop handing out search commands so import/refresh/status can't starve.
+                    var startedSearchCount = startedCommands.Count(c => c.Body.IsSearchCommand);
+                    if (startedSearchCount >= _maxConcurrentSearch)
+                    {
+                        queuedCommands = queuedCommands.Where(c => !c.Body.IsSearchCommand);
+                    }
+
+                    var localItem = queuedCommands.OrderByDescending(c => c.Priority)
                                           .ThenBy(c => c.QueuedAt)
                                           .FirstOrDefault();
 

@@ -8,5 +8,6 @@ namespace NzbDrone.Core.IndexerSearch
         public int SeasonNumber { get; set; }
 
         public override bool SendUpdatesToClient => true;
+        public override bool IsSearchCommand => true;
     }
 }

@@ -94,6 +94,12 @@ namespace Sonarr.Api.V3.Commands
             _commandQueueManager.Cancel(id);
         }
 
+        [HttpDelete]
+        public object CancelCommands([FromQuery] string name = null)
+        {
+            return new { cancelled = _commandQueueManager.CancelMany(name).Count };
+        }
+
         [NonAction]
         public void Handle(CommandUpdatedEvent message)
         {
