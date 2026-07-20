@@ -18,7 +18,7 @@ RUN dotnet build src/Sonarr.Api.V3/Sonarr.Api.V3.csproj \
   && echo "=== located Core/Api.V3 assemblies ===" \
   && find /src -name 'Sonarr.Core.dll' -o -name 'Sonarr.Api.V3.dll' \
   && mkdir -p /overlay \
-  && cp /src/_output/Sonarr.Core.dll /src/_output/Sonarr.Api.V3.dll /overlay/ \
+  && cp /src/_output/net6.0/Sonarr.Core.dll /src/_output/net6.0/Sonarr.Api.V3.dll /overlay/ \
   && ls -la /overlay
 
 FROM ghcr.io/home-operations/sonarr@sha256:2cd77fb3d81909a734d61bb8f71462044cb9d2f187e626a28a05a5c4e4be8fd2
