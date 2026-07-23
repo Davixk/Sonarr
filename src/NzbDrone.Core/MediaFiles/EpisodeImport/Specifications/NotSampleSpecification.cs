@@ -27,7 +27,9 @@ namespace NzbDrone.Core.MediaFiles.EpisodeImport.Specifications
 
             try
             {
-                var sample = _detectSample.IsSample(localEpisode);
+                // Reuse the result computed during the parallel probe phase when available so the file is
+                // not probed for its runtime a second time; fall back to probing when it was not precomputed.
+                var sample = localEpisode.SampleResult ?? _detectSample.IsSample(localEpisode);
 
                 if (sample == DetectSampleResult.Sample)
                 {

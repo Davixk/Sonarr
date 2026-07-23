@@ -1,6 +1,8 @@
 using System;
 using System.Collections.Generic;
 using System.Linq;
+using System.Runtime.ExceptionServices;
+using System.Threading;
 using NLog;
 using NzbDrone.Common.Disk;
 using NzbDrone.Common.Extensions;
@@ -24,6 +26,14 @@ namespace NzbDrone.Core.MediaFiles.EpisodeImport
 
     public class ImportDecisionMaker : IMakeImportDecision
     {
+        // Bounded, configurable degree of parallelism for the probe/decision phase. The probe/media-info
+        // work (ffprobe) is IO bound, so a slow/hung probe on one file must not block the others. A degree
+        // of 1 reproduces the original serial behaviour exactly. Configurable via IMPORT_PROBE_THREADS so
+        // slow hardware is never excluded by a hardcoded value.
+        private const int DEFAULT_PROBE_THREADS = 4;
+        private const int PROBE_THREADS_LOWER_BOUND = 1;
+        private const int PROBE_THREADS_UPPER_BOUND = 16;
+
         private readonly IEnumerable<IImportDecisionEngineSpecification> _specifications;
         private readonly IMediaFileService _mediaFileService;
         private readonly IAggregationService _aggregationService;
@@ -80,14 +90,49 @@ namespace NzbDrone.Core.MediaFiles.EpisodeImport
                 downloadClientItemInfo = Parser.Parser.ParseTitle(downloadClientItem.Title);
             }
 
-            // If not importing from a scene source (series folder for example), then assume all files are not samples
-            // to avoid using media info on every file needlessly (especially if Analyse Media Files is disabled).
-            var nonSampleVideoFileCount = sceneSource ? GetNonSampleVideoFileCount(newFiles, series, downloadClientItemInfo, folderInfo) : videoFiles.Count;
+            var degreeOfParallelism = GetProbeDegreeOfParallelism();
 
-            var decisions = new List<ImportDecision>();
+            // Force the lazy-loaded quality profile once up front so the parallel passes below only read
+            // the cached value instead of racing to load it from the database concurrently (LazyLoad is
+            // not thread safe). This is the only lazy-loaded member the parallel region touches.
+            _ = series.QualityProfile?.Value;
 
-            foreach (var file in newFiles)
+            // Phase 1 (bounded parallel): sample detection. This folds the previously serial
+            // GetNonSampleVideoFileCount pre-pass into the parallel probe region so a slow probe here does
+            // not serialize the whole batch. The result is stored on LocalEpisode and reused by the sample
+            // specification. As before, sample detection only runs for scene sources; otherwise all files
+            // are assumed to not be samples to avoid probing every file needlessly.
+            var sampleResults = new DetectSampleResult?[newFiles.Count];
+            int nonSampleVideoFileCount;
+
+            if (sceneSource)
             {
+                var isPossibleSpecialEpisode = (downloadClientItemInfo?.IsPossibleSpecialEpisode ?? false) ||
+                                               (folderInfo?.IsPossibleSpecialEpisode ?? false);
+
+                RunInParallel(newFiles.Count, degreeOfParallelism, i =>
+                {
+                    sampleResults[i] = _detectSample.IsSample(series, newFiles[i], isPossibleSpecialEpisode);
+                });
+
+                nonSampleVideoFileCount = sampleResults.Count(r => r != DetectSampleResult.Sample);
+            }
+            else
+            {
+                nonSampleVideoFileCount = videoFiles.Count;
+            }
+
+            var otherVideoFiles = nonSampleVideoFileCount > 1;
+
+            // Phase 2 (bounded parallel): the probe/aggregate heavy per-file work (parse, media info via
+            // Augment, custom formats). Results are collected by input index so ordering stays
+            // deterministic regardless of the order the probes complete in.
+            var prepared = new PreparedDecision[newFiles.Count];
+
+            RunInParallel(newFiles.Count, degreeOfParallelism, i =>
+            {
+                var file = newFiles[i];
+
                 var localEpisode = new LocalEpisode
                 {
                     Series = series,
@@ -97,10 +142,30 @@ namespace NzbDrone.Core.MediaFiles.EpisodeImport
                     Path = file,
                     SceneSource = sceneSource,
                     ExistingFile = series.Path.IsParentPath(file),
-                    OtherVideoFiles = nonSampleVideoFileCount > 1
+                    OtherVideoFiles = otherVideoFiles,
+                    SampleResult = sampleResults[i]
                 };
 
-                decisions.AddIfNotNull(GetDecision(localEpisode, downloadClientItem, nonSampleVideoFileCount > 1));
+                prepared[i] = Prepare(localEpisode, downloadClientItem);
+            });
+
+            // Phase 3 (serial, input order): evaluate specifications, assemble decisions and log.
+            // Specification evaluation, history/DB lookups and logging all stay single threaded and
+            // ordered to keep behaviour, logs and tests deterministic.
+            var decisions = new List<ImportDecision>(prepared.Length);
+
+            foreach (var item in prepared)
+            {
+                if (item.Error != null)
+                {
+                    _logger.Error(item.Error, "Couldn't import file. {0}", item.LocalEpisode.Path);
+                }
+
+                var decision = item.Decision ?? GetDecision(item.LocalEpisode, downloadClientItem);
+
+                LogDecision(decision, item.LocalEpisode);
+
+                decisions.AddIfNotNull(decision);
             }
 
             return decisions;
@@ -114,10 +179,12 @@ namespace NzbDrone.Core.MediaFiles.EpisodeImport
             return new ImportDecision(localEpisode, reasons.ToArray());
         }
 
-        private ImportDecision GetDecision(LocalEpisode localEpisode, DownloadClientItem downloadClientItem, bool otherFiles)
+        private PreparedDecision Prepare(LocalEpisode localEpisode, DownloadClientItem downloadClientItem)
         {
-            ImportDecision decision = null;
-
+            // Runs inside the bounded parallel region: only the probe/aggregate heavy IO happens here. Any
+            // early rejection is captured and returned so the serial phase can log and assemble it in
+            // deterministic input order. Exceptions are captured (not logged here) so all logging stays
+            // serial.
             try
             {
                 var fileEpisodeInfo = Parser.Parser.ParsePath(localEpisode.Path);
@@ -135,46 +202,44 @@ namespace NzbDrone.Core.MediaFiles.EpisodeImport
                 {
                     if (IsPartialSeason(localEpisode))
                     {
-                        decision = new ImportDecision(localEpisode, new ImportRejection(ImportRejectionReason.PartialSeason, "Partial season packs are not supported"));
+                        return new PreparedDecision(localEpisode, new ImportDecision(localEpisode, new ImportRejection(ImportRejectionReason.PartialSeason, "Partial season packs are not supported")), null);
                     }
-                    else if (IsSeasonExtra(localEpisode))
+
+                    if (IsSeasonExtra(localEpisode))
                     {
-                        decision = new ImportDecision(localEpisode, new ImportRejection(ImportRejectionReason.SeasonExtra, "Extras are not supported"));
+                        return new PreparedDecision(localEpisode, new ImportDecision(localEpisode, new ImportRejection(ImportRejectionReason.SeasonExtra, "Extras are not supported")), null);
                     }
-                    else
-                    {
-                        decision = new ImportDecision(localEpisode, new ImportRejection(ImportRejectionReason.InvalidSeasonOrEpisode, "Invalid season or episode"));
-                    }
+
+                    return new PreparedDecision(localEpisode, new ImportDecision(localEpisode, new ImportRejection(ImportRejectionReason.InvalidSeasonOrEpisode, "Invalid season or episode")), null);
                 }
-                else
+
+                if (downloadClientItem?.DownloadId.IsNotNullOrWhiteSpace() == true)
                 {
-                    if (downloadClientItem?.DownloadId.IsNotNullOrWhiteSpace() == true)
+                    var trackedDownload = _trackedDownloadService.Find(downloadClientItem.DownloadId);
+
+                    if (trackedDownload?.RemoteEpisode?.Release?.IndexerFlags != null)
                     {
-                        var trackedDownload = _trackedDownloadService.Find(downloadClientItem.DownloadId);
-
-                        if (trackedDownload?.RemoteEpisode?.Release?.IndexerFlags != null)
-                        {
-                            localEpisode.IndexerFlags = trackedDownload.RemoteEpisode.Release.IndexerFlags;
-                        }
+                        localEpisode.IndexerFlags = trackedDownload.RemoteEpisode.Release.IndexerFlags;
                     }
-
-                    localEpisode.CustomFormats = _formatCalculator.ParseCustomFormat(localEpisode);
-                    localEpisode.CustomFormatScore = localEpisode.Series.QualityProfile?.Value.CalculateCustomFormatScore(localEpisode.CustomFormats) ?? 0;
-
-                    decision = GetDecision(localEpisode, downloadClientItem);
                 }
+
+                localEpisode.CustomFormats = _formatCalculator.ParseCustomFormat(localEpisode);
+                localEpisode.CustomFormatScore = localEpisode.Series.QualityProfile?.Value.CalculateCustomFormatScore(localEpisode.CustomFormats) ?? 0;
+
+                return new PreparedDecision(localEpisode, null, null);
             }
             catch (AugmentingFailedException)
             {
-                decision = new ImportDecision(localEpisode, new ImportRejection(ImportRejectionReason.UnableToParse, "Unable to parse file"));
+                return new PreparedDecision(localEpisode, new ImportDecision(localEpisode, new ImportRejection(ImportRejectionReason.UnableToParse, "Unable to parse file")), null);
             }
             catch (Exception ex)
             {
-                _logger.Error(ex, "Couldn't import file. {0}", localEpisode.Path);
-
-                decision = new ImportDecision(localEpisode, new ImportRejection(ImportRejectionReason.Error, "Unexpected error processing file"));
+                return new PreparedDecision(localEpisode, new ImportDecision(localEpisode, new ImportRejection(ImportRejectionReason.Error, "Unexpected error processing file")), ex);
             }
+        }
 
+        private void LogDecision(ImportDecision decision, LocalEpisode localEpisode)
+        {
             if (decision == null)
             {
                 _logger.Error("Unable to make a decision on {0}", localEpisode.Path);
@@ -187,8 +252,6 @@ namespace NzbDrone.Core.MediaFiles.EpisodeImport
             {
                 _logger.Debug("File accepted");
             }
-
-            return decision;
         }
 
         private ImportRejection EvaluateSpec(IImportDecisionEngineSpecification spec, LocalEpisode localEpisode, DownloadClientItem downloadClientItem)
@@ -213,24 +276,85 @@ namespace NzbDrone.Core.MediaFiles.EpisodeImport
             return null;
         }
 
-        private int GetNonSampleVideoFileCount(List<string> videoFiles, Series series, ParsedEpisodeInfo downloadClientItemInfo, ParsedEpisodeInfo folderInfo)
+        private int GetProbeDegreeOfParallelism()
         {
-            var isPossibleSpecialEpisode = downloadClientItemInfo?.IsPossibleSpecialEpisode ?? false;
+            var envValue = Environment.GetEnvironmentVariable("IMPORT_PROBE_THREADS") ?? $"{DEFAULT_PROBE_THREADS}";
+            var threads = DEFAULT_PROBE_THREADS;
 
-            // If we might already have a special, don't try to get it from the folder info.
-            isPossibleSpecialEpisode = isPossibleSpecialEpisode || (folderInfo?.IsPossibleSpecialEpisode ?? false);
-
-            return videoFiles.Count(file =>
+            if (int.TryParse(envValue, out var parsedThreads))
             {
-                var sample = _detectSample.IsSample(series, file, isPossibleSpecialEpisode);
+                threads = parsedThreads;
+            }
 
-                if (sample == DetectSampleResult.Sample)
+            threads = Math.Max(PROBE_THREADS_LOWER_BOUND, threads);
+            threads = Math.Min(PROBE_THREADS_UPPER_BOUND, threads);
+
+            return threads;
+        }
+
+        // Runs body(i) for i in [0, count) across at most 'degree' dedicated worker threads. A degree of
+        // 1 (or a single item) runs inline on the calling thread, reproducing the original serial
+        // behaviour exactly. Dedicated threads are used (rather than the thread pool) so exactly 'degree'
+        // probes run concurrently without waiting on thread-pool injection, bounding concurrent ffprobe
+        // processes to 'degree'. The first exception thrown by any worker is rethrown to the caller.
+        private static void RunInParallel(int count, int degree, Action<int> body)
+        {
+            if (count <= 0)
+            {
+                return;
+            }
+
+            if (degree <= 1 || count == 1)
+            {
+                for (var i = 0; i < count; i++)
                 {
-                    return false;
+                    body(i);
                 }
 
-                return true;
-            });
+                return;
+            }
+
+            var workerCount = Math.Min(degree, count);
+            var nextIndex = -1;
+            Exception firstError = null;
+            var threads = new Thread[workerCount];
+
+            for (var w = 0; w < workerCount; w++)
+            {
+                var thread = new Thread(() =>
+                {
+                    int index;
+
+                    while ((index = Interlocked.Increment(ref nextIndex)) < count)
+                    {
+                        try
+                        {
+                            body(index);
+                        }
+                        catch (Exception ex)
+                        {
+                            Interlocked.CompareExchange(ref firstError, ex, null);
+                        }
+                    }
+                })
+                {
+                    IsBackground = true,
+                    Name = "ImportProbe"
+                };
+
+                threads[w] = thread;
+                thread.Start();
+            }
+
+            foreach (var thread in threads)
+            {
+                thread.Join();
+            }
+
+            if (firstError != null)
+            {
+                ExceptionDispatchInfo.Capture(firstError).Throw();
+            }
         }
 
         private bool IsPartialSeason(LocalEpisode localEpisode)
@@ -279,6 +403,22 @@ namespace NzbDrone.Core.MediaFiles.EpisodeImport
             }
 
             return false;
+        }
+
+        private sealed class PreparedDecision
+        {
+            public PreparedDecision(LocalEpisode localEpisode, ImportDecision decision, Exception error)
+            {
+                LocalEpisode = localEpisode;
+                Decision = decision;
+                Error = error;
+            }
+
+            public LocalEpisode LocalEpisode { get; }
+
+            public ImportDecision Decision { get; }
+
+            public Exception Error { get; }
         }
     }
 }

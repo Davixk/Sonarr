@@ -5,6 +5,7 @@ using NzbDrone.Core.CustomFormats;
 using NzbDrone.Core.Download;
 using NzbDrone.Core.Languages;
 using NzbDrone.Core.MediaFiles;
+using NzbDrone.Core.MediaFiles.EpisodeImport;
 using NzbDrone.Core.MediaFiles.MediaInfo;
 using NzbDrone.Core.Qualities;
 using NzbDrone.Core.Tv;
@@ -40,6 +41,10 @@ namespace NzbDrone.Core.Parser.Model
         public string ReleaseHash { get; set; }
         public string SceneName { get; set; }
         public bool OtherVideoFiles { get; set; }
+
+        // Sample-detection result computed once during the parallel probe phase so the sample
+        // specification can reuse it instead of probing the file a second time.
+        public DetectSampleResult? SampleResult { get; set; }
         public List<CustomFormat> CustomFormats { get; set; }
         public int CustomFormatScore { get; set; }
         public GrabbedReleaseInfo Release { get; set; }
