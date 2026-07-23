@@ -1,4 +1,5 @@
 using System.Collections.Generic;
+using System.Linq;
 using FizzWare.NBuilder;
 using FluentAssertions;
 using Moq;
@@ -74,6 +75,13 @@ namespace NzbDrone.Core.Test.Download.CompletedDownloadServiceTests
             Mocker.GetMock<IEpisodeService>()
                 .Setup(s => s.GetEpisodes(It.IsAny<IEnumerable<int>>()))
                 .Returns(new List<Episode>());
+
+            // The commit phase re-validates the decisions against the current DB before importing; the
+            // default here is a pass-through (nothing was imported concurrently) so behaviour matches the
+            // original serial decide-then-import flow.
+            Mocker.GetMock<IMakeImportDecision>()
+                  .Setup(s => s.RevalidateApprovedDecisions(It.IsAny<List<ImportDecision>>(), It.IsAny<DownloadClientItem>()))
+                  .Returns<List<ImportDecision>, DownloadClientItem>((decisions, downloadClientItem) => decisions);
         }
 
         private RemoteEpisode BuildRemoteEpisode()
@@ -86,6 +94,26 @@ namespace NzbDrone.Core.Test.Download.CompletedDownloadServiceTests
                     _episode1
                 }
             };
+        }
+
+        // Wires the split decide/commit seam so the completed download imports the given results: the
+        // decide phase returns a batch carrying the decisions, and the commit phase returns the results.
+        private void GivenImportResults(List<ImportResult> importResults)
+        {
+            Mocker.GetMock<IDownloadedEpisodesImportService>()
+                  .Setup(v => v.DecidePath(It.IsAny<string>(), It.IsAny<ImportMode>(), It.IsAny<Series>(), It.IsAny<DownloadClientItem>()))
+                  .Returns<string, ImportMode, Series, DownloadClientItem>((path, mode, series, downloadClientItem) =>
+                      new DownloadedEpisodesImportBatch
+                      {
+                          Decisions = importResults.Select(r => r.ImportDecision).ToList(),
+                          Series = series,
+                          ImportMode = mode,
+                          DownloadClientItem = downloadClientItem
+                      });
+
+            Mocker.GetMock<IDownloadedEpisodesImportService>()
+                  .Setup(v => v.ImportDecidedBatch(It.IsAny<DownloadedEpisodesImportBatch>()))
+                  .Returns(importResults);
         }
 
         private void GivenABadlyNamedDownload()
@@ -115,9 +143,7 @@ namespace NzbDrone.Core.Test.Download.CompletedDownloadServiceTests
         [Test]
         public void should_not_mark_as_imported_if_all_files_were_rejected()
         {
-            Mocker.GetMock<IDownloadedEpisodesImportService>()
-                  .Setup(v => v.ProcessPath(It.IsAny<string>(), It.IsAny<ImportMode>(), It.IsAny<Series>(), It.IsAny<DownloadClientItem>()))
-                  .Returns(new List<ImportResult>
+            GivenImportResults(new List<ImportResult>
                            {
                                new ImportResult(
                                    new ImportDecision(
@@ -139,9 +165,7 @@ namespace NzbDrone.Core.Test.Download.CompletedDownloadServiceTests
         [Test]
         public void should_not_mark_as_imported_if_no_episodes_were_parsed()
         {
-            Mocker.GetMock<IDownloadedEpisodesImportService>()
-                  .Setup(v => v.ProcessPath(It.IsAny<string>(), It.IsAny<ImportMode>(), It.IsAny<Series>(), It.IsAny<DownloadClientItem>()))
-                  .Returns(new List<ImportResult>
+            GivenImportResults(new List<ImportResult>
                            {
                                new ImportResult(
                                    new ImportDecision(
@@ -162,9 +186,7 @@ namespace NzbDrone.Core.Test.Download.CompletedDownloadServiceTests
         [Test]
         public void should_not_mark_as_imported_if_all_files_were_skipped()
         {
-            Mocker.GetMock<IDownloadedEpisodesImportService>()
-                  .Setup(v => v.ProcessPath(It.IsAny<string>(), It.IsAny<ImportMode>(), It.IsAny<Series>(), It.IsAny<DownloadClientItem>()))
-                  .Returns(new List<ImportResult>
+            GivenImportResults(new List<ImportResult>
                            {
                                new ImportResult(new ImportDecision(new LocalEpisode { Path = @"C:\TestPath\Droned.S01E01.mkv", Episodes = { _episode1 } }), "Test Failure"),
                                new ImportResult(new ImportDecision(new LocalEpisode { Path = @"C:\TestPath\Droned.S01E02.mkv", Episodes = { _episode2 } }), "Test Failure")
@@ -185,9 +207,7 @@ namespace NzbDrone.Core.Test.Download.CompletedDownloadServiceTests
                 new Episode()
             };
 
-            Mocker.GetMock<IDownloadedEpisodesImportService>()
-                  .Setup(v => v.ProcessPath(It.IsAny<string>(), It.IsAny<ImportMode>(), It.IsAny<Series>(), It.IsAny<DownloadClientItem>()))
-                  .Returns(new List<ImportResult>
+            GivenImportResults(new List<ImportResult>
                            {
                                new ImportResult(new ImportDecision(new LocalEpisode { Path = @"C:\TestPath\Droned.S01E01.mkv" })),
                                new ImportResult(new ImportDecision(new LocalEpisode { Path = @"C:\TestPath\Droned.S01E01.mkv" }), "Test Failure"),
@@ -213,9 +233,7 @@ namespace NzbDrone.Core.Test.Download.CompletedDownloadServiceTests
                                                           new Episode()
                                                       };
 
-            Mocker.GetMock<IDownloadedEpisodesImportService>()
-                  .Setup(v => v.ProcessPath(It.IsAny<string>(), It.IsAny<ImportMode>(), It.IsAny<Series>(), It.IsAny<DownloadClientItem>()))
-                  .Returns(new List<ImportResult>
+            GivenImportResults(new List<ImportResult>
                            {
                                new ImportResult(new ImportDecision(new LocalEpisode { Path = @"C:\TestPath\Droned.S01E01.mkv" })),
                                new ImportResult(new ImportDecision(new LocalEpisode { Path = @"C:\TestPath\Droned.S01E01.mkv" }), "Test Failure"),
@@ -245,9 +263,7 @@ namespace NzbDrone.Core.Test.Download.CompletedDownloadServiceTests
             var episode2 = new Episode { Id = 2 };
             _trackedDownload.RemoteEpisode.Episodes = new List<Episode> { episode1, episode2 };
 
-            Mocker.GetMock<IDownloadedEpisodesImportService>()
-                  .Setup(v => v.ProcessPath(It.IsAny<string>(), It.IsAny<ImportMode>(), It.IsAny<Series>(), It.IsAny<DownloadClientItem>()))
-                  .Returns(new List<ImportResult>
+            GivenImportResults(new List<ImportResult>
                            {
                                new ImportResult(
                                    new ImportDecision(
@@ -270,9 +286,7 @@ namespace NzbDrone.Core.Test.Download.CompletedDownloadServiceTests
             var episode2 = new Episode { Id = 2 };
             _trackedDownload.RemoteEpisode.Episodes = new List<Episode> { episode1, episode2 };
 
-            Mocker.GetMock<IDownloadedEpisodesImportService>()
-                .Setup(v => v.ProcessPath(It.IsAny<string>(), It.IsAny<ImportMode>(), It.IsAny<Series>(), It.IsAny<DownloadClientItem>()))
-                .Returns(new List<ImportResult>
+            GivenImportResults(new List<ImportResult>
                 {
                     new ImportResult(
                         new ImportDecision(
@@ -306,9 +320,7 @@ namespace NzbDrone.Core.Test.Download.CompletedDownloadServiceTests
             var episode2 = new Episode { Id = 2 };
             _trackedDownload.RemoteEpisode.Episodes = new List<Episode> { episode1, episode2 };
 
-            Mocker.GetMock<IDownloadedEpisodesImportService>()
-                  .Setup(v => v.ProcessPath(It.IsAny<string>(), It.IsAny<ImportMode>(), It.IsAny<Series>(), It.IsAny<DownloadClientItem>()))
-                  .Returns(new List<ImportResult>
+            GivenImportResults(new List<ImportResult>
                            {
                                new ImportResult(
                                    new ImportDecision(
@@ -330,9 +342,7 @@ namespace NzbDrone.Core.Test.Download.CompletedDownloadServiceTests
                                                           new Episode()
                                                       };
 
-            Mocker.GetMock<IDownloadedEpisodesImportService>()
-                  .Setup(v => v.ProcessPath(It.IsAny<string>(), It.IsAny<ImportMode>(), It.IsAny<Series>(), It.IsAny<DownloadClientItem>()))
-                  .Returns(new List<ImportResult>
+            GivenImportResults(new List<ImportResult>
                            {
                                new ImportResult(new ImportDecision(new LocalEpisode { Path = @"C:\TestPath\Droned.S01E01.mkv", Episodes = _trackedDownload.RemoteEpisode.Episodes })),
                                new ImportResult(new ImportDecision(new LocalEpisode { Path = @"C:\TestPath\Droned.S01E01.mkv" }), "Test Failure")
@@ -348,9 +358,7 @@ namespace NzbDrone.Core.Test.Download.CompletedDownloadServiceTests
         {
             GivenABadlyNamedDownload();
 
-            Mocker.GetMock<IDownloadedEpisodesImportService>()
-                  .Setup(v => v.ProcessPath(It.IsAny<string>(), It.IsAny<ImportMode>(), It.IsAny<Series>(), It.IsAny<DownloadClientItem>()))
-                  .Returns(new List<ImportResult>
+            GivenImportResults(new List<ImportResult>
                            {
                                new ImportResult(new ImportDecision(new LocalEpisode { Path = @"C:\TestPath\Droned.S01E01.mkv", Episodes = _trackedDownload.RemoteEpisode.Episodes }))
                            });
@@ -364,6 +372,20 @@ namespace NzbDrone.Core.Test.Download.CompletedDownloadServiceTests
             AssertImported();
         }
 
+        [Test]
+        public void should_revalidate_decisions_against_current_db_before_committing()
+        {
+            GivenImportResults(new List<ImportResult>
+                           {
+                               new ImportResult(new ImportDecision(new LocalEpisode { Path = @"C:\TestPath\Droned.S01E01.mkv", Episodes = new List<Episode> { _episode1 } }))
+                           });
+
+            Subject.Import(_trackedDownload);
+
+            Mocker.GetMock<IMakeImportDecision>()
+                  .Verify(s => s.RevalidateApprovedDecisions(It.IsAny<List<ImportDecision>>(), It.IsAny<DownloadClientItem>()), Times.Once());
+        }
+
         private void AssertNotImported()
         {
             Mocker.GetMock<IEventAggregator>()
@@ -375,7 +397,10 @@ namespace NzbDrone.Core.Test.Download.CompletedDownloadServiceTests
         private void AssertImported()
         {
             Mocker.GetMock<IDownloadedEpisodesImportService>()
-                .Verify(v => v.ProcessPath(_trackedDownload.DownloadItem.OutputPath.FullPath, ImportMode.Auto, _trackedDownload.RemoteEpisode.Series, _trackedDownload.DownloadItem), Times.Once());
+                .Verify(v => v.DecidePath(_trackedDownload.DownloadItem.OutputPath.FullPath, ImportMode.Auto, _trackedDownload.RemoteEpisode.Series, _trackedDownload.DownloadItem), Times.Once());
+
+            Mocker.GetMock<IDownloadedEpisodesImportService>()
+                .Verify(v => v.ImportDecidedBatch(It.IsAny<DownloadedEpisodesImportBatch>()), Times.Once());
 
             Mocker.GetMock<IEventAggregator>()
                   .Verify(v => v.PublishEvent(It.IsAny<DownloadCompletedEvent>()), Times.Once());

@@ -18,6 +18,14 @@ namespace NzbDrone.Core.MediaFiles
     {
         List<ImportResult> ProcessRootFolder(DirectoryInfo directoryInfo);
         List<ImportResult> ProcessPath(string path, ImportMode importMode = ImportMode.Auto, Series series = null, DownloadClientItem downloadClientItem = null);
+
+        // Read-only DECIDE phase: computes the import decisions (the ffprobe/media-info/decision work) for
+        // a path without importing anything. Safe to run concurrently across downloads.
+        DownloadedEpisodesImportBatch DecidePath(string path, ImportMode importMode = ImportMode.Auto, Series series = null, DownloadClientItem downloadClientItem = null);
+
+        // Mutating COMMIT phase: imports the (already decided) batch. Must run serially and in order.
+        List<ImportResult> ImportDecidedBatch(DownloadedEpisodesImportBatch batch);
+
         bool ShouldDeleteFolder(DirectoryInfo directoryInfo, Series series);
     }
 
@@ -75,34 +83,88 @@ namespace NzbDrone.Core.MediaFiles
 
         public List<ImportResult> ProcessPath(string path, ImportMode importMode = ImportMode.Auto, Series series = null, DownloadClientItem downloadClientItem = null)
         {
+            return ImportDecidedBatch(DecidePath(path, importMode, series, downloadClientItem));
+        }
+
+        public DownloadedEpisodesImportBatch DecidePath(string path, ImportMode importMode = ImportMode.Auto, Series series = null, DownloadClientItem downloadClientItem = null)
+        {
             _logger.Debug("Processing path: {0}", path);
 
             if (_diskProvider.FolderExists(path))
             {
                 var directoryInfo = new DirectoryInfo(path);
+                var folderSeries = series ?? _parsingService.GetSeries(GetCleanedUpFolderName(directoryInfo.Name));
 
-                if (series == null)
+                if (folderSeries == null)
                 {
-                    return ProcessFolder(directoryInfo, importMode, downloadClientItem);
+                    _logger.Debug("Unknown Series {0}", GetCleanedUpFolderName(directoryInfo.Name));
+
+                    return EarlyBatch(UnknownSeriesResult("Unknown Series"));
                 }
 
-                return ProcessFolder(directoryInfo, importMode, series, downloadClientItem);
+                return DecideFolder(directoryInfo, importMode, folderSeries, downloadClientItem);
             }
 
             if (_diskProvider.FileExists(path))
             {
                 var fileInfo = new FileInfo(path);
+                var fileSeries = series ?? _parsingService.GetSeries(Path.GetFileNameWithoutExtension(fileInfo.Name));
 
-                if (series == null)
+                if (fileSeries == null)
                 {
-                    return ProcessFile(fileInfo, importMode, downloadClientItem);
+                    _logger.Debug("Unknown Series for file: {0}", fileInfo.Name);
+
+                    return EarlyBatch(UnknownSeriesResult(string.Format("Unknown Series for file: {0}", fileInfo.Name), fileInfo.FullName));
                 }
 
-                return ProcessFile(fileInfo, importMode, series, downloadClientItem);
+                return DecideFile(fileInfo, importMode, fileSeries, downloadClientItem);
             }
 
             LogInaccessiblePathError(path);
-            return new List<ImportResult>();
+            return EarlyBatch();
+        }
+
+        public List<ImportResult> ImportDecidedBatch(DownloadedEpisodesImportBatch batch)
+        {
+            if (batch.EarlyResults != null)
+            {
+                return batch.EarlyResults;
+            }
+
+            var importMode = batch.ImportMode;
+            var importResults = _importApprovedEpisodes.Import(batch.Decisions, true, batch.DownloadClientItem, importMode);
+
+            if (importMode == ImportMode.Auto)
+            {
+                importMode = (batch.DownloadClientItem == null || batch.DownloadClientItem.CanMoveFiles) ? ImportMode.Move : ImportMode.Copy;
+            }
+
+            // Folder cleanup / empty-result checks only apply to a folder import (a single-file import
+            // leaves DirectoryInfo null, matching the original ProcessFile which did neither).
+            if (batch.DirectoryInfo != null)
+            {
+                if (importMode == ImportMode.Move &&
+                    importResults.Any(i => i.Result == ImportResultType.Imported) &&
+                    ShouldDeleteFolder(batch.DirectoryInfo, batch.Series))
+                {
+                    _logger.Debug("Deleting folder after importing valid files");
+
+                    try
+                    {
+                        _diskProvider.DeleteFolder(batch.DirectoryInfo.FullName, true);
+                    }
+                    catch (IOException e)
+                    {
+                        _logger.Debug(e, "Unable to delete folder after importing: {0}", e.Message);
+                    }
+                }
+                else if (importResults.Empty())
+                {
+                    importResults.AddIfNotNull(CheckEmptyResultForIssue(batch.DirectoryInfo.FullName));
+                }
+            }
+
+            return importResults;
         }
 
         public bool ShouldDeleteFolder(DirectoryInfo directoryInfo, Series series)
@@ -167,18 +229,18 @@ namespace NzbDrone.Core.MediaFiles
                        };
             }
 
-            return ProcessFolder(directoryInfo, importMode, series, downloadClientItem);
+            return ImportDecidedBatch(DecideFolder(directoryInfo, importMode, series, downloadClientItem));
         }
 
-        private List<ImportResult> ProcessFolder(DirectoryInfo directoryInfo, ImportMode importMode, Series series, DownloadClientItem downloadClientItem)
+        // Read-only DECIDE phase for a folder: everything the original ProcessFolder did up to and
+        // including GetImportDecisions, but WITHOUT importing. The import, folder cleanup and empty-result
+        // checks now live in ImportDecidedBatch (the serial commit phase).
+        private DownloadedEpisodesImportBatch DecideFolder(DirectoryInfo directoryInfo, ImportMode importMode, Series series, DownloadClientItem downloadClientItem)
         {
             if (_seriesService.SeriesPathExists(directoryInfo.FullName))
             {
                 _logger.Warn("Unable to process folder that is mapped to an existing series");
-                return new List<ImportResult>
-                {
-                    RejectionResult(ImportRejectionReason.SeriesFolder, "Import path is mapped to a series folder")
-                };
+                return EarlyBatch(RejectionResult(ImportRejectionReason.SeriesFolder, "Import path is mapped to a series folder"));
             }
 
             var folderInfo = Parser.Parser.ParseTitle(directoryInfo.Name);
@@ -190,43 +252,21 @@ namespace NzbDrone.Core.MediaFiles
                 {
                     if (_diskProvider.IsFileLocked(videoFile))
                     {
-                        return new List<ImportResult>
-                               {
-                                   FileIsLockedResult(videoFile)
-                               };
+                        return EarlyBatch(FileIsLockedResult(videoFile));
                     }
                 }
             }
 
             var decisions = _importDecisionMaker.GetImportDecisions(videoFiles.ToList(), series, downloadClientItem, folderInfo, true);
-            var importResults = _importApprovedEpisodes.Import(decisions, true, downloadClientItem, importMode);
 
-            if (importMode == ImportMode.Auto)
+            return new DownloadedEpisodesImportBatch
             {
-                importMode = (downloadClientItem == null || downloadClientItem.CanMoveFiles) ? ImportMode.Move : ImportMode.Copy;
-            }
-
-            if (importMode == ImportMode.Move &&
-                importResults.Any(i => i.Result == ImportResultType.Imported) &&
-                ShouldDeleteFolder(directoryInfo, series))
-            {
-                _logger.Debug("Deleting folder after importing valid files");
-
-                try
-                {
-                    _diskProvider.DeleteFolder(directoryInfo.FullName, true);
-                }
-                catch (IOException e)
-                {
-                    _logger.Debug(e, "Unable to delete folder after importing: {0}", e.Message);
-                }
-            }
-            else if (importResults.Empty())
-            {
-                importResults.AddIfNotNull(CheckEmptyResultForIssue(directoryInfo.FullName));
-            }
-
-            return importResults;
+                Decisions = decisions,
+                Series = series,
+                ImportMode = importMode,
+                DownloadClientItem = downloadClientItem,
+                DirectoryInfo = directoryInfo
+            };
         }
 
         private List<ImportResult> ProcessFile(FileInfo fileInfo, ImportMode importMode, DownloadClientItem downloadClientItem)
@@ -243,69 +283,72 @@ namespace NzbDrone.Core.MediaFiles
                        };
             }
 
-            return ProcessFile(fileInfo, importMode, series, downloadClientItem);
+            return ImportDecidedBatch(DecideFile(fileInfo, importMode, series, downloadClientItem));
         }
 
-        private List<ImportResult> ProcessFile(FileInfo fileInfo, ImportMode importMode, Series series, DownloadClientItem downloadClientItem)
+        // Read-only DECIDE phase for a single file: the extension guards and GetImportDecisions from the
+        // original ProcessFile, without importing. A single-file batch leaves DirectoryInfo null so the
+        // commit phase skips folder cleanup, exactly as the original ProcessFile did.
+        private DownloadedEpisodesImportBatch DecideFile(FileInfo fileInfo, ImportMode importMode, Series series, DownloadClientItem downloadClientItem)
         {
             if (Path.GetFileNameWithoutExtension(fileInfo.Name).StartsWith("._"))
             {
                 _logger.Debug("[{0}] starts with '._', skipping", fileInfo.FullName);
 
-                return new List<ImportResult>
-                       {
-                           new ImportResult(new ImportDecision(new LocalEpisode { Path = fileInfo.FullName }, new ImportRejection(ImportRejectionReason.InvalidFilePath, "Invalid video file, filename starts with '._'")), "Invalid video file, filename starts with '._'")
-                       };
+                return EarlyBatch(new ImportResult(new ImportDecision(new LocalEpisode { Path = fileInfo.FullName }, new ImportRejection(ImportRejectionReason.InvalidFilePath, "Invalid video file, filename starts with '._'")), "Invalid video file, filename starts with '._'"));
             }
 
             var extension = Path.GetExtension(fileInfo.Name);
 
             if (FileExtensions.DangerousExtensions.Contains(extension))
             {
-                return new List<ImportResult>
-                {
-                    new ImportResult(new ImportDecision(new LocalEpisode { Path = fileInfo.FullName },
-                            new ImportRejection(ImportRejectionReason.DangerousFile, $"Caution: Found potentially dangerous file with extension: {extension}")),
-                        $"Caution: Found potentially dangerous file with extension: {extension}")
-                };
+                return EarlyBatch(new ImportResult(new ImportDecision(new LocalEpisode { Path = fileInfo.FullName },
+                        new ImportRejection(ImportRejectionReason.DangerousFile, $"Caution: Found potentially dangerous file with extension: {extension}")),
+                    $"Caution: Found potentially dangerous file with extension: {extension}"));
             }
 
             if (FileExtensions.ExecutableExtensions.Contains(extension))
             {
-                return new List<ImportResult>
-                {
-                    new ImportResult(new ImportDecision(new LocalEpisode { Path = fileInfo.FullName },
-                            new ImportRejection(ImportRejectionReason.ExecutableFile, $"Caution: Found executable file with extension: '{extension}'")),
-                        $"Caution: Found executable file with extension: '{extension}'")
-                };
+                return EarlyBatch(new ImportResult(new ImportDecision(new LocalEpisode { Path = fileInfo.FullName },
+                        new ImportRejection(ImportRejectionReason.ExecutableFile, $"Caution: Found executable file with extension: '{extension}'")),
+                    $"Caution: Found executable file with extension: '{extension}'"));
             }
 
             if (extension.IsNullOrWhiteSpace() || !MediaFileExtensions.Extensions.Contains(extension))
             {
                 _logger.Debug("[{0}] has an unsupported extension: '{1}'", fileInfo.FullName, extension);
 
-                return new List<ImportResult>
-                       {
-                           new ImportResult(new ImportDecision(new LocalEpisode { Path = fileInfo.FullName },
-                               new ImportRejection(ImportRejectionReason.UnsupportedExtension, $"Invalid video file, unsupported extension: '{extension}'")),
-                               $"Invalid video file, unsupported extension: '{extension}'")
-                       };
+                return EarlyBatch(new ImportResult(new ImportDecision(new LocalEpisode { Path = fileInfo.FullName },
+                        new ImportRejection(ImportRejectionReason.UnsupportedExtension, $"Invalid video file, unsupported extension: '{extension}'")),
+                    $"Invalid video file, unsupported extension: '{extension}'"));
             }
 
             if (downloadClientItem == null)
             {
                 if (_diskProvider.IsFileLocked(fileInfo.FullName))
                 {
-                    return new List<ImportResult>
-                           {
-                               FileIsLockedResult(fileInfo.FullName)
-                           };
+                    return EarlyBatch(FileIsLockedResult(fileInfo.FullName));
                 }
             }
 
             var decisions = _importDecisionMaker.GetImportDecisions(new List<string>() { fileInfo.FullName }, series, downloadClientItem, null, true);
 
-            return _importApprovedEpisodes.Import(decisions, true, downloadClientItem, importMode);
+            return new DownloadedEpisodesImportBatch
+            {
+                Decisions = decisions,
+                Series = series,
+                ImportMode = importMode,
+                DownloadClientItem = downloadClientItem,
+                DirectoryInfo = null
+            };
+        }
+
+        private static DownloadedEpisodesImportBatch EarlyBatch(params ImportResult[] results)
+        {
+            return new DownloadedEpisodesImportBatch
+            {
+                EarlyResults = results.ToList()
+            };
         }
 
         private string GetCleanedUpFolderName(string folder)
