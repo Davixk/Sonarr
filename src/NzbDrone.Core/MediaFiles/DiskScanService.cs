@@ -123,6 +123,10 @@ namespace NzbDrone.Core.MediaFiles
                     _logger.Debug("Series folder doesn't exist: {0}", series.Path);
                 }
 
+                // fork5 coupling: passing an empty list here (series folder absent/unreachable) is safe ONLY
+                // because MediaFileTableCleanupService.Clean bails on empty-list-while-records-exist. If the
+                // folder is unreachable (a swallowed ENOTCONN via the FolderExists failsafe above) rather than
+                // truly empty, that rail is what stops this from mass-marking the series' files missing. Keep them paired.
                 CleanMediaFiles(series, new List<string>());
                 CompletedScanning(series, new List<string>());
 

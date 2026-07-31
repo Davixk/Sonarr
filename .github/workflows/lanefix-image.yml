@@ -36,6 +36,6 @@ jobs:
           file: Dockerfile.lanefix
           platforms: linux/amd64
           push: true
-          tags: ghcr.io/davixk/sonarr:v4.0.18.2978-fork4
+          tags: ghcr.io/davixk/sonarr:v4.0.18.2978-fork5
           cache-from: type=gha
           cache-to: type=gha,mode=max

@@ -20,26 +20,21 @@ namespace NzbDrone.Core.Test.MediaFiles
         private const string StorageRoot = @"C:\storage\__all__";
 
         private Series _series;
-        private string _root;
         private string _previousReap;
-        private string _previousRoot;
 
         [SetUp]
         public void SetUp()
         {
-            _root = StorageRoot.AsOsAgnostic();
-
             _series = Builder<Series>.CreateNew()
                                      .With(s => s.Path = (StorageRoot + @"\Series Title").AsOsAgnostic())
                                      .Build();
 
-            // Snapshot and clear the fork4 reaper knobs so each test drives them explicitly and never leaks.
+            // Snapshot and clear the fork5 reaper knob so each test drives it explicitly and never leaks. The
+            // master switch now defaults OFF, so the enable tests must set it true.
             _previousReap = Environment.GetEnvironmentVariable("REAP_DANGLING_SYMLINKS");
-            _previousRoot = Environment.GetEnvironmentVariable("REAP_STORAGE_ROOT");
             Environment.SetEnvironmentVariable("REAP_DANGLING_SYMLINKS", null);
-            Environment.SetEnvironmentVariable("REAP_STORAGE_ROOT", null);
 
-            // The reaper's root-health checks must run for real, so inject a real ScanReapGuard backed by
+            // The reaper's walk-up health check must run for real, so inject a real ScanReapGuard backed by
             // the same mocked IDiskProvider the scan uses.
             Mocker.SetConstant<IScanReapGuard>(new ScanReapGuard(Mocker.GetMock<IDiskProvider>().Object, TestLogger));
         }
@@ -48,7 +43,6 @@ namespace NzbDrone.Core.Test.MediaFiles
         public void TearDown()
         {
             Environment.SetEnvironmentVariable("REAP_DANGLING_SYMLINKS", _previousReap);
-            Environment.SetEnvironmentVariable("REAP_STORAGE_ROOT", _previousRoot);
         }
 
         private List<EpisodeFile> GivenSeriesFiles(params string[] relativePaths)
@@ -82,10 +76,9 @@ namespace NzbDrone.Core.Test.MediaFiles
             return Path.Combine(_series.Path, relativePath);
         }
 
-        private void GivenReaperConfig(bool? enabled, string storageRoot)
+        private void GivenReaperEnabled(bool? enabled)
         {
             Environment.SetEnvironmentVariable("REAP_DANGLING_SYMLINKS", enabled?.ToString());
-            Environment.SetEnvironmentVariable("REAP_STORAGE_ROOT", storageRoot);
         }
 
         private void GivenSizeReadThrows(string relativePath, Exception exception)
@@ -102,27 +95,35 @@ namespace NzbDrone.Core.Test.MediaFiles
                   .Returns(size);
         }
 
-        private void GivenRootHealthy()
+        // Walk-up ancestor states, driven per-directory through the errno-preserving GetFileSystemEntries the
+        // guard uses: an absent dir THROWS (ENOENT), a transport fault THROWS IOException (ENOTCONN/EIO), a
+        // populated dir returns a non-empty enumerable, an empty dir returns an empty enumerable.
+        private void GivenAncestorAbsent(string dir)
         {
-            Mocker.GetMock<IDiskProvider>().Setup(s => s.FolderExists(_root)).Returns(true);
-            Mocker.GetMock<IDiskProvider>().Setup(s => s.FolderEmpty(_root)).Returns(false);
+            Mocker.GetMock<IDiskProvider>()
+                  .Setup(s => s.GetFileSystemEntries(dir))
+                  .Throws(new DirectoryNotFoundException());
         }
 
-        private void GivenRootAbsent()
+        private void GivenAncestorPopulated(string dir)
         {
-            Mocker.GetMock<IDiskProvider>().Setup(s => s.FolderExists(_root)).Returns(false);
+            Mocker.GetMock<IDiskProvider>()
+                  .Setup(s => s.GetFileSystemEntries(dir))
+                  .Returns(new[] { Path.Combine(dir, "child") });
         }
 
-        private void GivenRootEmpty()
+        private void GivenAncestorEmpty(string dir)
         {
-            Mocker.GetMock<IDiskProvider>().Setup(s => s.FolderExists(_root)).Returns(true);
-            Mocker.GetMock<IDiskProvider>().Setup(s => s.FolderEmpty(_root)).Returns(true);
+            Mocker.GetMock<IDiskProvider>()
+                  .Setup(s => s.GetFileSystemEntries(dir))
+                  .Returns(Enumerable.Empty<string>());
         }
 
-        private void GivenRootEnumerationThrows()
+        private void GivenAncestorFaults(string dir)
         {
-            Mocker.GetMock<IDiskProvider>().Setup(s => s.FolderExists(_root)).Returns(true);
-            Mocker.GetMock<IDiskProvider>().Setup(s => s.FolderEmpty(_root)).Throws(new IOException("simulated ENOTCONN/EIO"));
+            Mocker.GetMock<IDiskProvider>()
+                  .Setup(s => s.GetFileSystemEntries(dir))
+                  .Throws(new IOException("simulated ENOTCONN/EIO"));
         }
 
         private void VerifyNoReap()
@@ -140,18 +141,50 @@ namespace NzbDrone.Core.Test.MediaFiles
 
             Assert.DoesNotThrow(() => Subject.Scan(_series));
 
-            // The loop finished (scan completed) and, with no storage root configured, nothing was reaped.
+            // The loop finished (scan completed) and, with the reaper defaulting off, nothing was reaped.
             VerifyEventPublished<SeriesScannedEvent>();
             VerifyNoReap();
         }
 
         [Test]
-        public void Reaper_does_NOT_reap_when_storage_root_absent()
+        public void Reaper_reaps_when_first_existing_ancestor_is_populated()
         {
-            GivenReaperConfig(true, _root);
+            GivenReaperEnabled(true);
+            var seriesFiles = GivenSeriesFiles("dead.mkv");
+            GivenSizeReadThrows("dead.mkv", new FileNotFoundException());
+
+            var seriesFolder = _series.Path;
+            var storageAll = Path.GetDirectoryName(seriesFolder);
+            var storage = Path.GetDirectoryName(storageAll);
+
+            // Target parent and grandparent do not exist; the first ancestor that DOES exist is populated, so
+            // the backing storage is mounted and this single link's target really went away.
+            GivenAncestorAbsent(seriesFolder);
+            GivenAncestorAbsent(storageAll);
+            GivenAncestorPopulated(storage);
+
+            Subject.Scan(_series);
+
+            Mocker.GetMock<IDiskProvider>().Verify(s => s.DeleteFile(PathOf("dead.mkv")), Times.Once());
+            Mocker.GetMock<IMediaFileService>().Verify(s => s.Delete(seriesFiles[0], DeleteMediaFileReason.MissingFromDisk), Times.Once());
+        }
+
+        [Test]
+        public void Reaper_aborts_when_first_existing_ancestor_is_empty()
+        {
+            GivenReaperEnabled(true);
             GivenSeriesFiles("dead.mkv");
             GivenSizeReadThrows("dead.mkv", new FileNotFoundException());
-            GivenRootAbsent();
+
+            var seriesFolder = _series.Path;
+            var storageAll = Path.GetDirectoryName(seriesFolder);
+            var storage = Path.GetDirectoryName(storageAll);
+
+            // Intermediate ancestors are gone; the first existing ancestor is EMPTY (a cleanly-unmounted
+            // mountpoint), so the backing storage is not mounted and nothing may be reaped.
+            GivenAncestorAbsent(seriesFolder);
+            GivenAncestorAbsent(storageAll);
+            GivenAncestorEmpty(storage);
 
             Subject.Scan(_series);
 
@@ -159,12 +192,18 @@ namespace NzbDrone.Core.Test.MediaFiles
         }
 
         [Test]
-        public void Reaper_does_NOT_reap_when_storage_root_present_but_empty()
+        public void Reaper_aborts_when_an_ancestor_faults()
         {
-            GivenReaperConfig(true, _root);
+            GivenReaperEnabled(true);
             GivenSeriesFiles("dead.mkv");
             GivenSizeReadThrows("dead.mkv", new FileNotFoundException());
-            GivenRootEmpty();
+
+            var seriesFolder = _series.Path;
+            var storageAll = Path.GetDirectoryName(seriesFolder);
+
+            // An ancestor faults with a plain IOException (ENOTCONN/EIO): the transport is degraded, abort.
+            GivenAncestorAbsent(seriesFolder);
+            GivenAncestorFaults(storageAll);
 
             Subject.Scan(_series);
 
@@ -172,44 +211,59 @@ namespace NzbDrone.Core.Test.MediaFiles
         }
 
         [Test]
-        public void Reaper_does_NOT_reap_when_root_enumeration_throws_IOException()
+        public void Reaper_does_NOT_escape_past_a_faulting_ancestor_to_a_populated_grandparent()
         {
-            GivenReaperConfig(true, _root);
+            GivenReaperEnabled(true);
             GivenSeriesFiles("dead.mkv");
             GivenSizeReadThrows("dead.mkv", new FileNotFoundException());
-            GivenRootEnumerationThrows();
+
+            var seriesFolder = _series.Path;
+            var mountPoint = Path.GetDirectoryName(seriesFolder);    // the dead mount
+            var hostFilesystem = Path.GetDirectoryName(mountPoint);  // populated host fs above the mount
+
+            // The immediate ancestor is absent, the mountpoint-level ancestor FAULTS (ENOTCONN/EIO), and the
+            // host filesystem ABOVE the mount is populated. A swallowing existence check (Directory.Exists /
+            // FolderExists) would treat the faulting mount as "absent" and let the walk escape UP to the
+            // populated host filesystem and reap the whole library. The errno-preserving enumerate must stop
+            // the walk at the fault.
+            GivenAncestorAbsent(seriesFolder);
+            GivenAncestorFaults(mountPoint);
+            GivenAncestorPopulated(hostFilesystem);
 
             Subject.Scan(_series);
 
+            // The walk stopped at the fault and never reached the populated grandparent: nothing reaped.
             VerifyNoReap();
         }
 
         [Test]
         public void Reaper_aborts_pass_on_non_ENOENT_IOException_from_size_read()
         {
-            GivenReaperConfig(true, _root);
+            GivenReaperEnabled(true);
             GivenSeriesFiles("faulting.mkv");
             GivenSizeReadThrows("faulting.mkv", new IOException("Transport endpoint is not connected"));
-            GivenRootHealthy();
 
             Assert.Throws<IOException>(() => Subject.Scan(_series));
 
-            // A transport fault aborts before acting: nothing deleted, nothing marked missing.
+            // A transport fault on the size read aborts the pass before the reaper is ever consulted: nothing
+            // deleted, nothing marked missing.
             VerifyNoReap();
         }
 
         [Test]
         public void Reaper_reap_deletes_symlink_and_marks_missing_no_blocklist()
         {
-            GivenReaperConfig(true, _root);
+            GivenReaperEnabled(true);
             var seriesFiles = GivenSeriesFiles("dead.mkv");
             GivenSizeReadThrows("dead.mkv", new FileNotFoundException());
-            GivenRootHealthy();
+
+            // Simplest healthy walk-up: the target's own parent directory exists and is populated.
+            GivenAncestorPopulated(_series.Path);
 
             Subject.Scan(_series);
 
-            // First ENOENT under a healthy root reaps: the symlink inode is unlinked and the record is
-            // marked missing with NO blocklist and NO history (DiskScanService touches neither service).
+            // First ENOENT under healthy storage reaps: the symlink inode is unlinked and the record is marked
+            // missing with NO blocklist and NO history (DiskScanService touches neither service).
             Mocker.GetMock<IDiskProvider>().Verify(s => s.DeleteFile(PathOf("dead.mkv")), Times.Once());
             Mocker.GetMock<IMediaFileService>().Verify(s => s.Delete(seriesFiles[0], DeleteMediaFileReason.MissingFromDisk), Times.Once());
             Mocker.GetMock<IMediaFileService>().Verify(s => s.Delete(It.IsAny<EpisodeFile>(), It.Is<DeleteMediaFileReason>(r => r != DeleteMediaFileReason.MissingFromDisk)), Times.Never());
@@ -218,10 +272,12 @@ namespace NzbDrone.Core.Test.MediaFiles
         [Test]
         public void Reaper_does_nothing_when_REAP_DANGLING_SYMLINKS_off()
         {
-            GivenReaperConfig(false, _root);
+            GivenReaperEnabled(false);
             GivenSeriesFiles("dead.mkv");
             GivenSizeReadThrows("dead.mkv", new FileNotFoundException());
-            GivenRootHealthy();
+
+            // Even with a populated (healthy) ancestor, an explicitly-disabled reaper never acts.
+            GivenAncestorPopulated(_series.Path);
 
             Subject.Scan(_series);
 
@@ -229,13 +285,13 @@ namespace NzbDrone.Core.Test.MediaFiles
         }
 
         [Test]
-        public void Reaper_does_nothing_when_REAP_STORAGE_ROOT_unset()
+        public void Reaper_defaults_off()
         {
-            GivenReaperConfig(true, null);
+            // REAP_DANGLING_SYMLINKS unset (cleared in SetUp): the master switch now defaults OFF.
             GivenSeriesFiles("dead.mkv");
             GivenSizeReadThrows("dead.mkv", new FileNotFoundException());
 
-            Assert.DoesNotThrow(() => Subject.Scan(_series));
+            Subject.Scan(_series);
 
             VerifyNoReap();
         }
