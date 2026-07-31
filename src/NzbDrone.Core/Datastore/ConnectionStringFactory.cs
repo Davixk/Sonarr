@@ -49,7 +49,7 @@ namespace NzbDrone.Core.Datastore
                 JournalMode = OsInfo.IsOsx ? SQLiteJournalModeEnum.Truncate : SQLiteJournalModeEnum.Wal,
                 Pooling = true,
                 Version = 3,
-                BusyTimeout = 100
+                BusyTimeout = GetBusyTimeout()
             };
 
             if (OsInfo.IsOsx)
@@ -73,6 +73,22 @@ namespace NzbDrone.Core.Datastore
             };
 
             return new DatabaseConnectionInfo(DatabaseType.PostgreSQL, connectionBuilder.ConnectionString);
+        }
+
+        // fork4: SQLITE_BUSY_TIMEOUT (ms). Default 1000 (matches upstream Radarr and Sonarr v5), which
+        // raises Sonarr's old 100 ms floor; clamped >= 100 so it never drops below that floor. Tunable
+        // higher for a large DB under heavy write load. internal so the value can be asserted directly and
+        // echoed by the startup config log.
+        internal static int GetBusyTimeout()
+        {
+            var raw = Environment.GetEnvironmentVariable("SQLITE_BUSY_TIMEOUT");
+
+            if (int.TryParse(raw, out var ms))
+            {
+                return Math.Max(100, ms);
+            }
+
+            return 1000;
         }
     }
 }
