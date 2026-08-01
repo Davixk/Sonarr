@@ -11,6 +11,7 @@ using NzbDrone.Core.MediaFiles.EpisodeImport.Manual;
 using NzbDrone.Core.Messaging.Commands;
 using NzbDrone.Core.Messaging.Events;
 using NzbDrone.Core.ProgressMessaging;
+using NzbDrone.Core.Tv;
 using NzbDrone.SignalR;
 using Sonarr.Http;
 using Sonarr.Http.REST;
@@ -23,6 +24,7 @@ namespace Sonarr.Api.V3.Commands
     public class CommandController : RestControllerWithSignalR<CommandResource, CommandModel>, IHandle<CommandUpdatedEvent>
     {
         private readonly IManageCommandQueue _commandQueueManager;
+        private readonly IEpisodeService _episodeService;
         private readonly KnownTypes _knownTypes;
         private readonly Debouncer _debouncer;
         private readonly Dictionary<int, CommandResource> _pendingUpdates;
@@ -31,10 +33,12 @@ namespace Sonarr.Api.V3.Commands
 
         public CommandController(IManageCommandQueue commandQueueManager,
                              IBroadcastSignalRMessage signalRBroadcaster,
+                             IEpisodeService episodeService,
                              KnownTypes knownTypes)
             : base(signalRBroadcaster)
         {
             _commandQueueManager = commandQueueManager;
+            _episodeService = episodeService;
             _knownTypes = knownTypes;
 
             _debouncer = new Debouncer(SendUpdates, TimeSpan.FromSeconds(0.1));
@@ -72,9 +76,42 @@ namespace Sonarr.Api.V3.Commands
                 command.SendUpdatesToClient = true;
                 command.ClientUserAgent = Request.Headers["UserAgent"];
 
+                ValidateManualImport(command);
+
                 var trackedCommand = _commandQueueManager.Push(command, priority, CommandTrigger.Manual);
 
                 return Created(trackedCommand.Id);
+            }
+        }
+
+        // fork6: reject a ManualImport whose selected episodeIds for a single file span more than one season,
+        // synchronously at accept time, instead of enqueueing a command that throws InvalidSeasonException in
+        // the executor and collapses to a bare "Failed to import episode". A single file maps to exactly one
+        // EpisodeFile with a single SeasonNumber, so a cross-season selection can never import.
+        private void ValidateManualImport(Command command)
+        {
+            if (command is not ManualImportCommand manualImportCommand)
+            {
+                return;
+            }
+
+            foreach (var file in manualImportCommand.Files)
+            {
+                if (file.EpisodeIds is not { Count: > 1 })
+                {
+                    continue;
+                }
+
+                var seasons = _episodeService.GetEpisodes(file.EpisodeIds)
+                                             .Select(e => e.SeasonNumber)
+                                             .Distinct()
+                                             .OrderBy(s => s)
+                                             .ToList();
+
+                if (seasons.Count > 1)
+                {
+                    throw new BadRequestException($"Episodes selected for '{file.Path}' span multiple seasons ({string.Join(", ", seasons)}). All episodes for a single file must belong to the same season.");
+                }
             }
         }
 

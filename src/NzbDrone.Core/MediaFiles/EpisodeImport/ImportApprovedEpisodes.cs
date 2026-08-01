@@ -218,7 +218,11 @@ namespace NzbDrone.Core.MediaFiles.EpisodeImport
                 catch (Exception e)
                 {
                     _logger.Warn(e, "Couldn't import episode " + localEpisode);
-                    importResults.Add(new ImportResult(importDecision, "Failed to import episode"));
+
+                    // fork6: surface the real exception message instead of collapsing every failure to a bare
+                    // "Failed to import episode". The reason is already in hand (e.g. InvalidSeasonException for
+                    // a cross-season set) and was being discarded, leaving the operator, UI and API with no cause.
+                    importResults.Add(new ImportResult(importDecision, "Failed to import episode: " + e.Message));
                 }
             }
 
