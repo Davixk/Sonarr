@@ -304,6 +304,20 @@ namespace NzbDrone.Core.Download
 
             if (allEpisodesImportedInHistory)
             {
+                var episodes = _episodeService.GetEpisodes(trackedDownload.RemoteEpisode.Episodes.Select(e => e.Id));
+
+                // fork12: history says these episodes were imported, but if any of them currently has NO file on disk
+                // (e.g. deleted by a MissingFromDisk wave after the original import), the "already imported" claim is
+                // stale. Marking this fresh grab Imported here removes it WITHOUT importing, silently eating a re-grab
+                // of a release whose files are gone. Leave it unmarked so the normal import pipeline processes it (its
+                // AlreadyImportedSpecification correctly skips the already-imported check for episodes without a file).
+                // A genuine duplicate is unaffected: its episodes still have their files.
+                if (episodes.Any(e => !e.HasFile))
+                {
+                    _logger.Debug("History reports '{0}' already imported, but one or more of its episodes have no file on disk now; letting the import pipeline process the fresh grab instead of removing it", trackedDownload.DownloadItem.Title);
+                    return false;
+                }
+
                 // Log different error messages depending on the circumstances, but treat both as fully imported, because that's the reality.
                 // The second message shouldn't be logged in most cases, but continued reporting would indicate an ongoing issue.
 
@@ -323,7 +337,6 @@ namespace NzbDrone.Core.Download
                            .Log();
                 }
 
-                var episodes = _episodeService.GetEpisodes(trackedDownload.RemoteEpisode.Episodes.Select(e => e.Id));
                 var files = _mediaFileService.GetFiles(episodes.Select(e => e.EpisodeFileId).Where(i => i > 0).Distinct());
 
                 trackedDownload.State = TrackedDownloadState.Imported;

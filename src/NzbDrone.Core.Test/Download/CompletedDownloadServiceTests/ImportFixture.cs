@@ -314,6 +314,41 @@ namespace NzbDrone.Core.Test.Download.CompletedDownloadServiceTests
         }
 
         [Test]
+        public void should_not_mark_as_imported_from_history_when_the_episodes_no_longer_have_files()
+        {
+            var episode1 = new Episode { Id = 1, EpisodeFileId = 0 };
+            var episode2 = new Episode { Id = 2, EpisodeFileId = 0 };
+            _trackedDownload.RemoteEpisode.Episodes = new List<Episode> { episode1, episode2 };
+
+            // Nothing imported this pass, matching the live bug: a fresh grab of a release whose previously-imported
+            // files were since deleted must NOT be marked imported+removed purely from history.
+            GivenImportResults(new List<ImportResult>
+                           {
+                               new ImportResult(new ImportDecision(new LocalEpisode { Path = @"C:\TestPath\Droned.S01E01.mkv" }), "Test Failure")
+                           });
+
+            var history = Builder<EpisodeHistory>.CreateListOfSize(2)
+                                                  .BuildList();
+
+            Mocker.GetMock<IHistoryService>()
+                  .Setup(s => s.FindByDownloadId(It.IsAny<string>()))
+                  .Returns(history);
+
+            Mocker.GetMock<ITrackedDownloadAlreadyImported>()
+                  .Setup(s => s.IsImported(It.IsAny<TrackedDownload>(), It.IsAny<List<EpisodeHistory>>()))
+                  .Returns(true);
+
+            // The historically-imported episodes currently have NO files on disk (deleted since the original import).
+            Mocker.GetMock<IEpisodeService>()
+                  .Setup(s => s.GetEpisodes(It.IsAny<IEnumerable<int>>()))
+                  .Returns(new List<Episode> { episode1, episode2 });
+
+            Subject.Import(_trackedDownload);
+
+            AssertNotImported();
+        }
+
+        [Test]
         public void should_mark_as_imported_if_double_episode_file_is_imported()
         {
             var episode1 = new Episode { Id = 1 };
