@@ -44,7 +44,7 @@ namespace NzbDrone.Core.Tv
 
                 if (missing.Any())
                 {
-                    _commandQueueManager.Push(new EpisodeSearchCommand(missing.Select(e => e.Id).ToList()));
+                    _commandQueueManager.Push(new EpisodeSearchCommand(missing.Select(e => e.Id).ToList()), CommandPriority.Low);
                 }
             }
 

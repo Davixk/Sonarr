@@ -53,7 +53,7 @@ namespace NzbDrone.Core.Download
             {
                 _logger.Debug("Failed download only contains one episode, searching again");
 
-                _commandQueueManager.Push(new EpisodeSearchCommand(message.EpisodeIds));
+                _commandQueueManager.Push(new EpisodeSearchCommand(message.EpisodeIds), CommandPriority.Low);
 
                 return;
             }

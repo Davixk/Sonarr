@@ -7,6 +7,7 @@ using NzbDrone.Common.Composition;
 using NzbDrone.Common.Serializer;
 using NzbDrone.Common.TPL;
 using NzbDrone.Core.Datastore.Events;
+using NzbDrone.Core.IndexerSearch;
 using NzbDrone.Core.MediaFiles.EpisodeImport.Manual;
 using NzbDrone.Core.Messaging.Commands;
 using NzbDrone.Core.Messaging.Events;
@@ -66,9 +67,19 @@ namespace Sonarr.Api.V3.Commands
             using (var reader = new StreamReader(Request.Body))
             {
                 var body = reader.ReadToEnd();
-                var priority = commandType == typeof(ManualImportCommand)
-                    ? CommandPriority.High
-                    : CommandPriority.Normal;
+                var priority = CommandPriority.Normal;
+
+                if (commandType == typeof(ManualImportCommand))
+                {
+                    priority = CommandPriority.High;
+                }
+                else if (commandType == typeof(EpisodeSearchCommand))
+                {
+                    // fork10: demote user/automation-triggered episode searches to Low so they yield the shared
+                    // worker lane to PMD (High) and Season/Series searches (Normal) instead of contending at
+                    // Normal. Season, Series, Missing and CutoffUnmet searches are unaffected.
+                    priority = CommandPriority.Low;
+                }
 
                 var command = STJson.Deserialize(body, commandType) as Command;
 
