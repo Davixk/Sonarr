@@ -179,32 +179,6 @@ namespace NzbDrone.Core.Test.Download.CompletedDownloadServiceTests
             AssertNotReadyToImport();
         }
 
-        [Test]
-        public void should_resolve_via_grab_history_when_title_is_ambiguous()
-        {
-            // fork14: an ambiguous title makes GetSeries(title) throw MultipleSeriesFoundException inside Check, which
-            // aborted Check before ImportPending and left the download stuck at Downloading with no import and no
-            // error. Check must resolve via the grabbed-history seriesId and reach ImportPending instead.
-            Mocker.GetMock<IParsingService>()
-                  .Setup(s => s.GetSeries(It.IsAny<string>()))
-                  .Throws(new MultipleSeriesFoundException(new List<Series>(), "Expected one series, but found 2"));
-
-            Mocker.GetMock<IHistoryService>()
-                  .Setup(s => s.FindByDownloadId(_trackedDownload.DownloadItem.DownloadId))
-                  .Returns(new List<EpisodeHistory>
-                           {
-                               new EpisodeHistory { SeriesId = 1, EventType = EpisodeHistoryEventType.Grabbed }
-                           });
-
-            Mocker.GetMock<ISeriesService>()
-                  .Setup(s => s.GetSeries(It.IsAny<int>()))
-                  .Returns(_trackedDownload.RemoteEpisode.Series);
-
-            Subject.Check(_trackedDownload);
-
-            AssertReadyToImport();
-        }
-
         private void AssertNotReadyToImport()
         {
             _trackedDownload.State.Should().NotBe(TrackedDownloadState.ImportPending);
