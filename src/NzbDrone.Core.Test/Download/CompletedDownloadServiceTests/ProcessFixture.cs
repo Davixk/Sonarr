@@ -179,6 +179,26 @@ namespace NzbDrone.Core.Test.Download.CompletedDownloadServiceTests
             AssertNotReadyToImport();
         }
 
+        [Test]
+        public void should_block_visibly_when_title_is_ambiguous()
+        {
+            // fork16 (option b): an ambiguous title -> visible ImportBlocked, NEVER auto-resolve via grab history.
+            Mocker.GetMock<IHistoryService>()
+                  .Setup(s => s.FindByDownloadId(_trackedDownload.DownloadItem.DownloadId))
+                  .Returns(new List<EpisodeHistory>
+                           {
+                               new EpisodeHistory { SeriesId = 1, EventType = EpisodeHistoryEventType.Grabbed }
+                           });
+
+            Mocker.GetMock<IParsingService>()
+                  .Setup(s => s.GetSeries(It.IsAny<string>()))
+                  .Throws(new MultipleSeriesFoundException(new List<Series>(), "Expected one series, but found 2"));
+
+            Subject.Check(_trackedDownload);
+
+            _trackedDownload.State.Should().Be(TrackedDownloadState.ImportBlocked);
+        }
+
         private void AssertNotReadyToImport()
         {
             _trackedDownload.State.Should().NotBe(TrackedDownloadState.ImportPending);

@@ -106,7 +106,22 @@ namespace NzbDrone.Core.Download
                 return;
             }
 
-            var series = _parsingService.GetSeries(trackedDownload.DownloadItem.Title);
+            Series series = null;
+
+            try
+            {
+                series = _parsingService.GetSeries(trackedDownload.DownloadItem.Title);
+            }
+            catch (MultipleSeriesFoundException)
+            {
+                // fork16 (option b, operator ruling): the download's title matches MULTIPLE library series and no layer
+                // can verify which the content actually is. Do NOT auto-resolve via grab history - that would import an
+                // assumption. Block VISIBLY for manual import.
+                trackedDownload.Warn("Ambiguous title - multiple library matches; manual import required");
+                SetStateToImportBlocked(trackedDownload);
+
+                return;
+            }
 
             if (series == null)
             {
