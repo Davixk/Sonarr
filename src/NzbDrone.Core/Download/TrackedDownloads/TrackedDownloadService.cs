@@ -123,7 +123,18 @@ namespace NzbDrone.Core.Download.TrackedDownloads
 
                 if (parsedEpisodeInfo != null)
                 {
-                    trackedDownload.RemoteEpisode = _parsingService.Map(parsedEpisodeInfo, 0, 0, null);
+                    try
+                    {
+                        trackedDownload.RemoteEpisode = _parsingService.Map(parsedEpisodeInfo, 0, 0, null);
+                    }
+                    catch (MultipleSeriesFoundException e)
+                    {
+                        // fork13: an ambiguous series title makes the title-based Map throw. Previously it bubbled to
+                        // the outer catch, left RemoteEpisode null, and the download stuck - re-erroring every poll.
+                        // Swallow it here so the grabbed-history seriesId fallback below resolves it deterministically.
+                        // (Radarr parity; Radarr is where this flooded live on Dracula/Dracula 1931 duplicates.)
+                        _logger.Debug(e, "Ambiguous title for '{0}', resolving via grabbed-history seriesId instead", downloadItem.Title);
+                    }
                 }
 
                 var downloadHistory = _downloadHistoryService.GetLatestDownloadHistoryItem(downloadItem.DownloadId);
@@ -203,6 +214,21 @@ namespace NzbDrone.Core.Download.TrackedDownloads
                 _logger.Debug(e, "Failed to find episode for " + downloadItem.Title);
 
                 trackedDownload.Warn("Unable to parse episodes from title");
+            }
+
+            // fork13: SECOND silent-eat site (fork12 only fixed CompletedDownloadService.VerifyImport). A re-grab
+            // that reuses a downloadId whose latest download-history event is DownloadImported gets State=Imported
+            // above from history alone, with no file-state check - and DownloadProcessingService then removes it
+            // (DownloadCanBeRemovedEvent -> RemoveItem) WITHOUT importing. If the episodes it "imported" no longer
+            // have files (deleted since the original import), that mark is stale, so downgrade to Downloading and
+            // let the completed-download pipeline (file-state-aware since fork12) process the fresh grab instead of
+            // silently removing it. A genuine already-imported download still has its files and is untouched.
+            if (trackedDownload.State == TrackedDownloadState.Imported &&
+                trackedDownload.RemoteEpisode != null &&
+                trackedDownload.RemoteEpisode.Episodes.Any(e => !e.HasFile))
+            {
+                _logger.Debug("Download '{0}' is marked imported in history, but its episodes have no files on disk now; treating it as not-imported so the fresh grab is processed instead of removed", downloadItem.Title);
+                trackedDownload.State = TrackedDownloadState.Downloading;
             }
 
             LogItemChange(trackedDownload, existingItem?.DownloadItem, trackedDownload.DownloadItem);

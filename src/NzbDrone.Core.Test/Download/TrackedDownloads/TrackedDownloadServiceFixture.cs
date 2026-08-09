@@ -4,6 +4,7 @@ using FluentAssertions;
 using Moq;
 using NUnit.Framework;
 using NzbDrone.Core.Download;
+using NzbDrone.Core.Download.History;
 using NzbDrone.Core.Download.TrackedDownloads;
 using NzbDrone.Core.History;
 using NzbDrone.Core.Indexers;
@@ -84,6 +85,81 @@ namespace NzbDrone.Core.Test.Download.TrackedDownloads
             trackedDownload.RemoteEpisode.Episodes.First().Id.Should().Be(4);
             trackedDownload.RemoteEpisode.ParsedEpisodeInfo.SeasonNumber.Should().Be(1);
             trackedDownload.RemoteEpisode.MappedSeasonNumber.Should().Be(1);
+        }
+
+        private DownloadClientItem GivenCompletedItem(string downloadId)
+        {
+            return new DownloadClientItem
+            {
+                Title = "TV Series - S01E01",
+                DownloadId = downloadId,
+                DownloadClientInfo = new DownloadClientItemClientInfo
+                {
+                    Id = 1,
+                    Type = "Blackhole",
+                    Name = "Blackhole Client",
+                    Protocol = DownloadProtocol.Torrent
+                }
+            };
+        }
+
+        private void GivenDownloadHistoryImported()
+        {
+            Mocker.GetMock<IDownloadHistoryService>()
+                  .Setup(s => s.GetLatestDownloadHistoryItem(It.IsAny<string>()))
+                  .Returns(new DownloadHistory { EventType = DownloadHistoryEventType.DownloadImported });
+        }
+
+        [Test]
+        public void should_not_mark_imported_from_history_when_episodes_have_no_files()
+        {
+            // fork13 second-eat site: download history says imported, but the episodes have no files now (deleted
+            // since). Must NOT be left in the Imported state (which DownloadProcessingService would silently remove).
+            var remoteEpisode = new RemoteEpisode
+            {
+                Series = new Series { Id = 5 },
+                Episodes = new List<Episode> { new Episode { Id = 4, EpisodeFileId = 0 } },
+                ParsedEpisodeInfo = new ParsedEpisodeInfo { SeriesTitle = "TV Series", SeasonNumber = 1, EpisodeNumbers = new[] { 1 } }
+            };
+
+            Mocker.GetMock<IParsingService>()
+                  .Setup(s => s.Map(It.IsAny<ParsedEpisodeInfo>(), It.IsAny<int>(), It.IsAny<int>(), It.IsAny<string>(), null))
+                  .Returns(remoteEpisode);
+
+            Mocker.GetMock<IHistoryService>()
+                  .Setup(s => s.FindByDownloadId(It.IsAny<string>()))
+                  .Returns(new List<EpisodeHistory>());
+
+            GivenDownloadHistoryImported();
+
+            var trackedDownload = Subject.TrackDownload(new DownloadClientDefinition { Id = 1, Protocol = DownloadProtocol.Torrent }, GivenCompletedItem("12345"));
+
+            trackedDownload.State.Should().Be(TrackedDownloadState.Downloading);
+        }
+
+        [Test]
+        public void should_mark_imported_from_history_when_episodes_still_have_files()
+        {
+            var remoteEpisode = new RemoteEpisode
+            {
+                Series = new Series { Id = 5 },
+                Episodes = new List<Episode> { new Episode { Id = 4, EpisodeFileId = 11 } },
+                ParsedEpisodeInfo = new ParsedEpisodeInfo { SeriesTitle = "TV Series", SeasonNumber = 1, EpisodeNumbers = new[] { 1 } }
+            };
+
+            Mocker.GetMock<IParsingService>()
+                  .Setup(s => s.Map(It.IsAny<ParsedEpisodeInfo>(), It.IsAny<int>(), It.IsAny<int>(), It.IsAny<string>(), null))
+                  .Returns(remoteEpisode);
+
+            Mocker.GetMock<IHistoryService>()
+                  .Setup(s => s.FindByDownloadId(It.IsAny<string>()))
+                  .Returns(new List<EpisodeHistory>());
+
+            GivenDownloadHistoryImported();
+
+            var trackedDownload = Subject.TrackDownload(new DownloadClientDefinition { Id = 1, Protocol = DownloadProtocol.Torrent }, GivenCompletedItem("12345"));
+
+            trackedDownload.State.Should().Be(TrackedDownloadState.Imported);
         }
 
         [Test]
