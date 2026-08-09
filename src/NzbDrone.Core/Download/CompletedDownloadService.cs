@@ -106,7 +106,19 @@ namespace NzbDrone.Core.Download
                 return;
             }
 
-            var series = _parsingService.GetSeries(trackedDownload.DownloadItem.Title);
+            Series series = null;
+
+            try
+            {
+                series = _parsingService.GetSeries(trackedDownload.DownloadItem.Title);
+            }
+            catch (MultipleSeriesFoundException)
+            {
+                // fork14: an ambiguous series title makes the title-based GetSeries throw HERE, aborting Check before
+                // it sets ImportPending - so the download sat at completed/Downloading forever, no import, no error
+                // (fork13 fixed the TrackDownload throw, but Check has its OWN title-parse). Leave series null so the
+                // grabbed-history seriesId fallback below resolves it, exactly like the null path. (Radarr parity.)
+            }
 
             if (series == null)
             {
