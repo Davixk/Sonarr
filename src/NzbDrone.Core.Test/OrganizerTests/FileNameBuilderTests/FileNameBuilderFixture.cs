@@ -861,6 +861,22 @@ namespace NzbDrone.Core.Test.OrganizerTests.FileNameBuilderTests
                    .Should().Be(expected);
         }
 
+        // fork19: a file with many audio dub tracks must not serialize every language into the filename
+        // (that blew the path past the filesystem limit and threw PathTooLongException during import).
+        [TestCase("eng/deu/fr", "[EN+DE+FR]")]
+        [TestCase("eng/deu/fr/it/ja", "[EN+DE+FR+MULTI]")]
+        public void should_bound_audio_languages_token_to_avoid_path_too_long(string audioLanguages, string expected)
+        {
+            _episodeFile.ReleaseGroup = null;
+
+            GivenMediaInfoModel(audioLanguages: audioLanguages);
+
+            _namingConfig.StandardEpisodeFormat = "{MediaInfo AudioLanguages}";
+
+            Subject.BuildFileName(new List<Episode> { _episode1 }, _series, _episodeFile)
+                   .Should().Be(expected);
+        }
+
         [TestCase("eng", "[EN]")]
         [TestCase("eng/deu", "[EN+DE]")]
         public void should_format_audio_languages_all(string audioLanguages, string expected)
