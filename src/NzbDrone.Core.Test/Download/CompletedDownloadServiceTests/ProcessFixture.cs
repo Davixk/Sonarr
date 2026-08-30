@@ -3,12 +3,14 @@ using FizzWare.NBuilder;
 using FluentAssertions;
 using Moq;
 using NUnit.Framework;
+using NzbDrone.Common.Cache;
 using NzbDrone.Common.Disk;
 using NzbDrone.Core.Download;
 using NzbDrone.Core.Download.TrackedDownloads;
 using NzbDrone.Core.History;
 using NzbDrone.Core.MediaFiles;
 using NzbDrone.Core.MediaFiles.EpisodeImport;
+using NzbDrone.Core.MetadataSource;
 using NzbDrone.Core.Parser;
 using NzbDrone.Core.Parser.Model;
 using NzbDrone.Core.Test.Framework;
@@ -197,6 +199,51 @@ namespace NzbDrone.Core.Test.Download.CompletedDownloadServiceTests
             Subject.Check(_trackedDownload);
 
             _trackedDownload.State.Should().Be(TrackedDownloadState.ImportBlocked);
+        }
+
+        [Test]
+        public void should_block_when_the_metadata_source_has_multiple_series_with_the_same_title()
+        {
+            // fork23 #3: no year in the release AND the metadata source knows >1 series with this bare title
+            // -> cannot safely resolve -> visible ImportBlocked (not a silent wrong-show import).
+            Mocker.SetConstant<ICacheManager>(Mocker.Resolve<CacheManager>());
+
+            _trackedDownload.DownloadItem.Category = "tv";
+            GivenNoGrabbedHistory();
+            GivenSeriesMatch();
+
+            Mocker.GetMock<ISearchForNewSeries>()
+                  .Setup(s => s.SearchForNewSeries(It.IsAny<string>()))
+                  .Returns(new List<Series>
+                           {
+                               new Series { TvdbId = 82818, Title = "Drone" },
+                               new Series { TvdbId = 78508, Title = "Drone" }
+                           });
+
+            Subject.Check(_trackedDownload);
+
+            _trackedDownload.State.Should().Be(TrackedDownloadState.ImportBlocked);
+        }
+
+        [Test]
+        public void should_process_when_the_metadata_source_has_a_single_series_with_the_title()
+        {
+            Mocker.SetConstant<ICacheManager>(Mocker.Resolve<CacheManager>());
+
+            _trackedDownload.DownloadItem.Category = "tv";
+            GivenNoGrabbedHistory();
+            GivenSeriesMatch();
+
+            Mocker.GetMock<ISearchForNewSeries>()
+                  .Setup(s => s.SearchForNewSeries(It.IsAny<string>()))
+                  .Returns(new List<Series>
+                           {
+                               new Series { TvdbId = 82818, Title = "Drone" }
+                           });
+
+            Subject.Check(_trackedDownload);
+
+            _trackedDownload.State.Should().Be(TrackedDownloadState.ImportPending);
         }
 
         private void AssertNotReadyToImport()

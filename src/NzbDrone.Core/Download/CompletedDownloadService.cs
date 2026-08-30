@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.IO;
 using System.Linq;
 using NLog;
+using NzbDrone.Common.Cache;
 using NzbDrone.Common.EnvironmentInfo;
 using NzbDrone.Common.Extensions;
 using NzbDrone.Common.Instrumentation.Extensions;
@@ -11,6 +12,7 @@ using NzbDrone.Core.History;
 using NzbDrone.Core.MediaFiles;
 using NzbDrone.Core.MediaFiles.EpisodeImport;
 using NzbDrone.Core.Messaging.Events;
+using NzbDrone.Core.MetadataSource;
 using NzbDrone.Core.Parser;
 using NzbDrone.Core.Parser.Model;
 using NzbDrone.Core.Tv;
@@ -48,6 +50,8 @@ namespace NzbDrone.Core.Download
         private readonly IEpisodeService _episodeService;
         private readonly IMediaFileService _mediaFileService;
         private readonly IRejectedImportService _rejectedImportService;
+        private readonly ISearchForNewSeries _searchForNewSeries;
+        private readonly ICached<bool> _sourceAmbiguityCache;
         private readonly Logger _logger;
 
         public CompletedDownloadService(IEventAggregator eventAggregator,
@@ -61,6 +65,8 @@ namespace NzbDrone.Core.Download
                                         IEpisodeService episodeService,
                                         IMediaFileService mediaFileService,
                                         IRejectedImportService rejectedImportService,
+                                        ISearchForNewSeries searchForNewSeries,
+                                        ICacheManager cacheManager,
                                         Logger logger)
         {
             _eventAggregator = eventAggregator;
@@ -74,6 +80,8 @@ namespace NzbDrone.Core.Download
             _episodeService = episodeService;
             _mediaFileService = mediaFileService;
             _rejectedImportService = rejectedImportService;
+            _searchForNewSeries = searchForNewSeries;
+            _sourceAmbiguityCache = cacheManager.GetCache<bool>(GetType(), "sourceAmbiguity");
             _logger = logger;
         }
 
@@ -160,7 +168,66 @@ namespace NzbDrone.Core.Download
                 }
             }
 
+            // fork23 #3 (operator-commissioned): the series was resolved from the release title, but a year-less
+            // title that matches ONE library series can still be the wrong show when the metadata SOURCE knows
+            // more than one series with that bare title (e.g. "Pippi Longstocking" -> tvdb 82818 (1969) AND
+            // 78508 (1997)). fork16 only catches ambiguity that already exists IN the library. Here we ask the
+            // source: no year in the release AND >1 series share this bare title at the metadata provider ->
+            // cannot safely resolve -> block for manual action rather than import silently into the wrong show.
+            if (IsAmbiguousAtMetadataSource(trackedDownload.DownloadItem.Title))
+            {
+                trackedDownload.Warn("Ambiguous title - the release has no year and more than one series shares this title at the metadata source; manual import required");
+                SetStateToImportBlocked(trackedDownload);
+
+                return;
+            }
+
             trackedDownload.State = TrackedDownloadState.ImportPending;
+        }
+
+        private bool IsAmbiguousAtMetadataSource(string releaseTitle)
+        {
+            var parsed = Parser.Parser.ParseTitle(releaseTitle);
+
+            // Only the year-less shape is ambiguous; a release that states its year disambiguates itself.
+            if (parsed?.SeriesTitleInfo == null || parsed.SeriesTitleInfo.Year > 0)
+            {
+                return false;
+            }
+
+            var bareTitle = parsed.SeriesTitleInfo.TitleWithoutYear;
+
+            if (bareTitle.IsNullOrWhiteSpace())
+            {
+                return false;
+            }
+
+            var cleanTitle = bareTitle.CleanSeriesTitle();
+
+            try
+            {
+                // Cached: source-side ambiguity of a title is stable, and Check re-runs for a blocked item every
+                // refresh, so we must not hit the metadata provider each pass. Gated on the year-less shape above,
+                // so the lookup only fires for the ambiguous minority.
+                return _sourceAmbiguityCache.Get(cleanTitle, () => SourceHasMultipleSeriesNamed(bareTitle, cleanTitle), TimeSpan.FromHours(6));
+            }
+            catch (Exception ex)
+            {
+                // Metadata provider unreachable/errored: degrade to stock behaviour (do not block). The exception
+                // leaves the cache unset, so it is retried next time rather than a failure being cached.
+                _logger.Debug(ex, "Metadata-source ambiguity lookup failed for '{0}'; not blocking", bareTitle);
+
+                return false;
+            }
+        }
+
+        private bool SourceHasMultipleSeriesNamed(string bareTitle, string cleanTitle)
+        {
+            return _searchForNewSeries.SearchForNewSeries(bareTitle)
+                                      .Where(s => s.Title.CleanSeriesTitle() == cleanTitle)
+                                      .Select(s => s.TvdbId)
+                                      .Distinct()
+                                      .Count() > 1;
         }
 
         public void Import(TrackedDownload trackedDownload)

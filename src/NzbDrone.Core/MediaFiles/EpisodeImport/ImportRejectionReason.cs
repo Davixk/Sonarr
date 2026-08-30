@@ -36,5 +36,6 @@ public enum ImportRejectionReason
     NotQualityUpgrade,
     NotRevisionUpgrade,
     NotCustomFormatUpgrade,
-    AudioLanguageMismatch
+    AudioLanguageMismatch,
+    DolbyVisionExcluded
 }
