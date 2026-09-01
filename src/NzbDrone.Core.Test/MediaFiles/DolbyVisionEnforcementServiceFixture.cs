@@ -10,6 +10,7 @@ using NzbDrone.Core.Download;
 using NzbDrone.Core.History;
 using NzbDrone.Core.MediaFiles;
 using NzbDrone.Core.MediaFiles.EpisodeImport.Specifications;
+using NzbDrone.Core.MediaFiles.Events;
 using NzbDrone.Core.MediaFiles.MediaInfo;
 using NzbDrone.Core.Test.Framework;
 using NzbDrone.Core.Tv;
@@ -100,6 +101,47 @@ namespace NzbDrone.Core.Test.MediaFiles
             Mocker.GetMock<IFailedDownloadService>().Verify(v => v.MarkAsFailed(It.IsAny<int>(), It.IsAny<string>(), It.IsAny<bool>()), Times.Never());
 
             ExceptionVerification.ExpectedWarns(1);
+        }
+
+        [Test]
+        public void should_enforce_on_every_file_on_scan_when_active()
+        {
+            GivenGrabHistory();
+
+            var files = new List<EpisodeFile>
+            {
+                Builder<EpisodeFile>.CreateNew().With(f => f.MediaInfo = GivenDovi(5, 0)).With(f => f.Episodes = new List<Episode> { new Episode { Id = 7 } }).Build(),
+                Builder<EpisodeFile>.CreateNew().With(f => f.MediaInfo = GivenDovi(5, 0)).With(f => f.Episodes = new List<Episode> { new Episode { Id = 7 } }).Build()
+            };
+
+            Mocker.GetMock<IMediaFileService>()
+                .Setup(s => s.GetFilesBySeries(_series.Id))
+                .Returns(files);
+
+            Subject.Handle(new SeriesScannedEvent(_series, new List<string>()));
+
+            Mocker.GetMock<IDeleteMediaFiles>().Verify(v => v.DeleteEpisodeFile(_series, It.IsAny<EpisodeFile>()), Times.Exactly(2));
+
+            ExceptionVerification.ExpectedWarns(2);
+        }
+
+        [Test]
+        public void should_not_enforce_on_scan_when_not_configured()
+        {
+            Environment.SetEnvironmentVariable("DV_REJECT_PROFILES", null);
+
+            var files = new List<EpisodeFile>
+            {
+                Builder<EpisodeFile>.CreateNew().With(f => f.MediaInfo = GivenDovi(5, 0)).Build()
+            };
+
+            Mocker.GetMock<IMediaFileService>()
+                .Setup(s => s.GetFilesBySeries(_series.Id))
+                .Returns(files);
+
+            Subject.Handle(new SeriesScannedEvent(_series, new List<string>()));
+
+            Mocker.GetMock<IDeleteMediaFiles>().Verify(v => v.DeleteEpisodeFile(It.IsAny<Series>(), It.IsAny<EpisodeFile>()), Times.Never());
         }
     }
 }
