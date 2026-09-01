@@ -1,6 +1,9 @@
+using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
+using System.Reflection;
+using FFMpegCore;
 using FizzWare.NBuilder;
 using FluentAssertions;
 using Moq;
@@ -12,6 +15,7 @@ using NzbDrone.Core.History;
 using NzbDrone.Core.MediaFiles;
 using NzbDrone.Core.MediaFiles.EpisodeImport;
 using NzbDrone.Core.MediaFiles.Events;
+using NzbDrone.Core.MediaFiles.MediaInfo;
 using NzbDrone.Core.Messaging.Events;
 using NzbDrone.Core.Parser.Model;
 using NzbDrone.Core.Profiles.Qualities;
@@ -78,9 +82,25 @@ namespace NzbDrone.Core.Test.MediaFiles.EpisodeImport
                 .Build();
         }
 
+        [TearDown]
+        public void TearDown()
+        {
+            Environment.SetEnvironmentVariable("DV_REJECT_PROFILES", null);
+            Environment.SetEnvironmentVariable("DV_REJECT_COMPAT_IDS", null);
+        }
+
         private void GivenNewDownload()
         {
             _approvedDecisions.ForEach(a => a.LocalEpisode.Path = Path.Combine(_downloadClientItem.OutputPath.ToString(), Path.GetFileName(a.LocalEpisode.Path)));
+        }
+
+        private MediaInfoModel GivenDoviMediaInfo(int profile, int compatId)
+        {
+            var dovi = (DoviConfigurationRecordSideData)Assembly.GetAssembly(typeof(FFProbe)).CreateInstance("FFMpegCore.DoviConfigurationRecordSideData");
+            dovi.DvProfile = profile;
+            dovi.DvBlSignalCompatibilityId = compatId;
+
+            return new MediaInfoModel { DoviConfigurationRecord = dovi };
         }
 
         private void GivenExistingFileOnDisk()
@@ -119,6 +139,66 @@ namespace NzbDrone.Core.Test.MediaFiles.EpisodeImport
 
             result.Should().HaveCount(5);
             result.First().Errors.Should().Contain(e => e.Contains("a specific import failure reason"));
+
+            ExceptionVerification.ExpectedWarns(5);
+        }
+
+        [Test]
+        public void should_revert_and_reject_excluded_dolby_vision_from_remote_client()
+        {
+            // fork24: a remote/debrid import whose pre-move probe missed the DV record; the reliable local
+            // re-probe here catches Profile 5 -> the just-committed file is reverted, no import event fires
+            // (Plex never sees it), and the decision is rewritten as a DolbyVisionExcluded rejection.
+            Environment.SetEnvironmentVariable("DV_REJECT_PROFILES", "5");
+
+            GivenNewDownload();
+            _downloadClientItem.Title = "30.Rock.S01E01";
+            _downloadClientItem.CanMoveFiles = false;
+
+            Mocker.GetMock<IUpgradeMediaFiles>()
+                  .Setup(s => s.UpgradeEpisodeFile(It.IsAny<EpisodeFile>(), It.IsAny<LocalEpisode>(), It.IsAny<bool>()))
+                  .Callback<EpisodeFile, LocalEpisode, bool>((ef, le, c) => ef.RelativePath = "30 Rock - S01E01 - Pilot.mkv")
+                  .Returns(new EpisodeFileMoveResult());
+
+            Mocker.GetMock<IMediaFileService>()
+                  .Setup(s => s.Add(It.IsAny<EpisodeFile>()))
+                  .Returns<EpisodeFile>(ef => ef);
+
+            Mocker.GetMock<IVideoFileInfoReader>()
+                  .Setup(r => r.GetMediaInfo(It.IsAny<string>()))
+                  .Returns(GivenDoviMediaInfo(5, 0));
+
+            var result = Subject.Import(new List<ImportDecision> { _approvedDecisions.First() }, true, _downloadClientItem);
+
+            Mocker.GetMock<IDeleteMediaFiles>()
+                  .Verify(v => v.DeleteEpisodeFile(It.IsAny<Series>(), It.IsAny<EpisodeFile>()), Times.Once());
+
+            Mocker.GetMock<IEventAggregator>()
+                  .Verify(v => v.PublishEvent(It.IsAny<EpisodeImportedEvent>()), Times.Never());
+
+            result.Should().ContainSingle(r => r.Result == ImportResultType.Rejected &&
+                r.ImportDecision.Rejections.Any(x => x.Reason == ImportRejectionReason.DolbyVisionExcluded));
+
+            ExceptionVerification.ExpectedWarns(1);
+        }
+
+        [Test]
+        public void should_not_re_probe_local_client_imports()
+        {
+            // a local client (CanMoveFiles true) was already probed reliably pre-move; no extra re-probe.
+            Environment.SetEnvironmentVariable("DV_REJECT_PROFILES", "5");
+
+            GivenNewDownload();
+            _downloadClientItem.Title = "30.Rock.S01E01";
+            _downloadClientItem.CanMoveFiles = true;
+
+            Subject.Import(new List<ImportDecision> { _approvedDecisions.First() }, true, _downloadClientItem);
+
+            Mocker.GetMock<IVideoFileInfoReader>()
+                  .Verify(r => r.GetMediaInfo(It.IsAny<string>()), Times.Never());
+
+            Mocker.GetMock<IEventAggregator>()
+                  .Verify(v => v.PublishEvent(It.IsAny<EpisodeImportedEvent>()), Times.Once());
         }
 
         [Test]
