@@ -565,5 +565,65 @@ namespace NzbDrone.Core.Test.MediaFiles.EpisodeImport.Specifications
 
             Subject.IsSatisfiedBy(_localEpisode, null).Accepted.Should().BeFalse();
         }
+
+        [Test]
+        public void should_reject_identical_release_re_presented_with_a_different_probe()
+        {
+            // fork27: the SAME release re-grabbed = same quality + same size (byte-identical) + same custom-format
+            // score. Only the non-deterministic MediaInfo probe differs, which is not a quality change. Must be a
+            // NO-OP, else the delete+re-import renames the file and kills Plex's stored path. RED on stock (a tie
+            // is accepted and the file is replaced), GREEN with the same-release guard.
+            var episodeFile = new EpisodeFile
+            {
+                Quality = new QualityModel(Quality.Bluray2160p),
+                Size = 8_000_000_000L
+            };
+
+            Mocker.GetMock<ICustomFormatCalculationService>()
+                .Setup(s => s.ParseCustomFormat(episodeFile))
+                .Returns(new List<CustomFormat>());
+
+            _localEpisode.Quality = new QualityModel(Quality.Bluray2160p);
+            _localEpisode.Size = 8_000_000_000L;
+            _localEpisode.CustomFormatScore = 0;
+
+            _localEpisode.Episodes = Builder<Episode>.CreateListOfSize(1)
+                .All()
+                .With(e => e.EpisodeFileId = 1)
+                .With(e => e.EpisodeFile = new LazyLoaded<EpisodeFile>(episodeFile))
+                .Build()
+                .ToList();
+
+            Subject.IsSatisfiedBy(_localEpisode, null).Accepted.Should().BeFalse();
+        }
+
+        [Test]
+        public void should_accept_a_same_score_release_of_a_different_size()
+        {
+            // fork27 guard is surgical: it must NOT block a genuinely different same-score release (different
+            // bytes = different size), e.g. a language "upgrade" with no language custom format. Stock preserved.
+            var episodeFile = new EpisodeFile
+            {
+                Quality = new QualityModel(Quality.Bluray2160p),
+                Size = 8_000_000_000L
+            };
+
+            Mocker.GetMock<ICustomFormatCalculationService>()
+                .Setup(s => s.ParseCustomFormat(episodeFile))
+                .Returns(new List<CustomFormat>());
+
+            _localEpisode.Quality = new QualityModel(Quality.Bluray2160p);
+            _localEpisode.Size = 7_500_000_000L;
+            _localEpisode.CustomFormatScore = 0;
+
+            _localEpisode.Episodes = Builder<Episode>.CreateListOfSize(1)
+                .All()
+                .With(e => e.EpisodeFileId = 1)
+                .With(e => e.EpisodeFile = new LazyLoaded<EpisodeFile>(episodeFile))
+                .Build()
+                .ToList();
+
+            Subject.IsSatisfiedBy(_localEpisode, null).Accepted.Should().BeTrue();
+        }
     }
 }
